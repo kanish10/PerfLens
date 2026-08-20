@@ -1,0 +1,46 @@
+# Kernel suite manifest for the self-hosted RTX 3060 runner.
+#
+# `cwd` paths are relative to wherever `perflens run` is invoked from on the
+# runner box (see README.md's runner setup section) -- they point at sibling
+# checkouts of the P1 GPU-engine repo and the CUDA ray tracer repo, pinned
+# alongside this repo on that machine. They will not resolve on a laptop that
+# only has PerfLens checked out; that's expected -- `perflens run` requires
+# `ncu` and these sibling repos, and is meant to run on the GPU box.
+gpu: "RTX 3060"
+reps: 5
+entries:
+  - name: inference.paged_attention
+    cwd: ../gpu-engine
+    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    kernel_regex: "paged_attention.*"
+    source_paths: ["src/kernels/attention.cu"]
+
+  - name: inference.fused_gelu
+    cwd: ../gpu-engine
+    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    kernel_regex: "bias_gelu.*"
+    source_paths: ["src/kernels/gelu.cu"]
+
+  - name: inference.layernorm
+    cwd: ../gpu-engine
+    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    kernel_regex: "layer_norm.*|layernorm.*"
+    source_paths: ["src/kernels/layernorm.cu"]
+
+  - name: inference.kv_scatter
+    cwd: ../gpu-engine
+    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    kernel_regex: "kv_scatter.*|scatter_kv.*"
+    source_paths: ["src/kernels/kv_cache.cu"]
+
+  - name: inference.argmax
+    cwd: ../gpu-engine
+    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    kernel_regex: "argmax.*|sample_argmax.*"
+    source_paths: ["src/kernels/sampling.cu"]
+
+  - name: raytracer.trace
+    cwd: ../cuda-ray-tracer
+    cmd: ./build/rt --scene bench.scene --frames 3 --headless
+    kernel_regex: "trace_rays.*"
+    source_paths: ["src/trace.cu"]

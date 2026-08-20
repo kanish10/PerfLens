@@ -1,0 +1,14 @@
+{
+  "entry": "inference.paged_attention",
+  "kernel": "paged_attention_kernel",
+  "metric": "duration_ns",
+  "base_median": 12450.0,
+  "new_median": 15600.0,
+  "delta_pct": 25.3,
+  "evidence": {
+    "regs_per_thread_delta_pct": 50.0,
+    "occupancy_pct_delta_pct": -18.0
+  },
+  "severity": "major",
+  "kind": "regression"
+}
