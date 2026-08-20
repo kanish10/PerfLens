@@ -52,7 +52,7 @@ jobs:
         id: run
         run: |
           perflens run --branch "${{ github.head_ref }}" --git-sha "${{ github.event.pull_request.head.sha }}"
-          run_id=$(sqlite3 perflens.db "SELECT id FROM runs ORDER BY id DESC LIMIT 1;")
+          run_id=$(python -c "import sqlite3; print(sqlite3.connect('perflens.db').execute('SELECT id FROM runs ORDER BY id DESC LIMIT 1').fetchone()[0])")
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: perflens gate

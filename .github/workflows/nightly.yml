@@ -20,6 +20,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # `perflens triage` diffs against HEAD~1; a shallow clone can't resolve it
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -53,7 +55,7 @@ jobs:
         id: run
         run: |
           perflens run --branch "${{ github.ref_name }}" --git-sha "${{ github.sha }}"
-          run_id=$(sqlite3 perflens.db "SELECT id FROM runs ORDER BY id DESC LIMIT 1;")
+          run_id=$(python -c "import sqlite3; print(sqlite3.connect('perflens.db').execute('SELECT id FROM runs ORDER BY id DESC LIMIT 1').fetchone()[0])")
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: perflens detect
@@ -83,14 +85,17 @@ jobs:
           git push
 
       - name: Open issue on major findings
-        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if grep -q '\[MAJOR\]' <<< "$(perflens detect --run '${{ steps.run.outputs.run_id }}')"; then
-            report_file="reports/$(date -u +%F).md"
+          major_count=$(python -c "
+          import json
+          findings = json.load(open('findings.json'))
+          print(sum(1 for f in findings if f['kind'] == 'regression' and f['severity'] == 'major'))
+          ")
+          if [ "$major_count" -gt 0 ]; then
             gh issue create \
-              --title "PerfLens: major regression detected $(date -u +%F)" \
-              --body-file "$report_file" \
+              --title "PerfLens: $major_count major regression(s) detected $(date -u +%F)" \
+              --body-file "reports/$(date -u +%F).md" \
               --label "perf-regression"
           fi
