@@ -5,6 +5,7 @@ with secondary metrics attached as diagnostic-only evidence (never gate alone).
 from __future__ import annotations
 
 import sqlite3
+import warnings
 
 from perflens import store
 from perflens.models import Finding, Severity
@@ -68,6 +69,13 @@ def detect_regressions(
             baseline_run["gpu"] != run["gpu"] or baseline_run["driver"] != run["driver"]
         ):
             # Discipline: never compare across different gpu/driver strings.
+            warnings.warn(
+                f"skipping {entry}/{kernel}: baseline was set on "
+                f"{baseline_run['gpu']!r}/{baseline_run['driver']!r}, "
+                f"this run is on {run['gpu']!r}/{run['driver']!r} -- "
+                "run `perflens baseline set` on this GPU/driver to compare",
+                stacklevel=2,
+            )
             continue
 
         new_metrics = store.compute_medians(conn, run_id, entry, kernel)

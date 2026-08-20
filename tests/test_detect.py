@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from perflens import detect, store
 from perflens.models import KernelResultRecord
 
@@ -180,4 +182,5 @@ def test_gpu_driver_mismatch_skips_comparison(conn: sqlite3.Connection, make_run
     ]
     store.insert_kernel_results(conn, other_gpu_run, big_records)
 
-    assert detect.detect_regressions(conn, other_gpu_run) == []
+    with pytest.warns(UserWarning, match="RTX 3060.*RTX 4090"):
+        assert detect.detect_regressions(conn, other_gpu_run) == []
