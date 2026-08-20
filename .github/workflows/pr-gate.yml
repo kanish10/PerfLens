@@ -1,0 +1,67 @@
+name: PR performance gate
+
+# Runs on the same self-hosted GPU box as nightly.yml. Restricted to PRs from
+# branches of this repo (never forks) and label-triggered to save GPU time --
+# see CLAUDE.md hard constraint #4 and README.md's self-hosted runner
+# security section for why.
+on:
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  gate:
+    # Belt-and-suspenders: the label check below is the real gate, but this
+    # `if` also skips the job (and the GPU minutes) entirely for fork PRs and
+    # for pushes that didn't (re)apply the `perf` label.
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    concurrency:
+      group: perflens-gpu
+      cancel-in-progress: false
+    steps:
+      - name: Re-verify same-repo PR (defense in depth)
+        run: |
+          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "::error::refusing to run self-hosted job for a fork PR"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PerfLens
+        run: pip install -e .
+
+      - name: perflens run
+        id: run
+        run: |
+          perflens run --branch "${{ github.head_ref }}" --git-sha "${{ github.event.pull_request.head.sha }}"
+          run_id=$(sqlite3 perflens.db "SELECT id FROM runs ORDER BY id DESC LIMIT 1;")
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: perflens gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          perflens gate \
+            --run "${{ steps.run.outputs.run_id }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --pr "${{ github.event.pull_request.number }}"

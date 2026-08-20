@@ -1,8 +1,9 @@
-"""perflens CLI: run | baseline set | detect | triage | report | gate."""
+"""perflens CLI: run | baseline set | detect | triage | report | gate | dashboard."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -317,6 +318,24 @@ def gate_cmd(
 
     if major:
         raise SystemExit(1)
+
+
+@main.command("dashboard")
+@click.option("--db", default=DEFAULT_DB, show_default=True)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8000, show_default=True, type=int)
+@click.option("--reload", is_flag=True, help="Auto-reload on code changes (development only)")
+def dashboard_cmd(db: str, host: str, port: int, reload: bool) -> None:
+    """Serve the read-only dashboard API (M7 stretch) over the SQLite store."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise click.ClickException(
+            "the dashboard needs the optional deps: pip install -e '.[dashboard]'"
+        ) from exc
+
+    os.environ["PERFLENS_DB"] = db
+    uvicorn.run("perflens.dashboard.api:app", host=host, port=port, reload=reload)
 
 
 if __name__ == "__main__":

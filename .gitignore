@@ -25,5 +25,6 @@ perflens.db
 
 node_modules/
 dashboard-ui/dist/
+*.tsbuildinfo
 
 .DS_Store

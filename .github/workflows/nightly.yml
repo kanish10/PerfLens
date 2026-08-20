@@ -1,0 +1,96 @@
+name: Nightly regression run
+
+# Self-hosted GPU runner only -- see README.md "Self-hosted runner setup".
+# Cron is UTC; 15:00 UTC = 00:00 JST.
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  nightly:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    concurrency:
+      group: perflens-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PerfLens
+        run: pip install -e .
+
+      - name: Build suite dependencies if HEAD moved
+        # gpu-engine and cuda-ray-tracer are pinned sibling checkouts on the
+        # runner box (see suite.yaml). Only rebuild what changed.
+        run: |
+          for repo in ../gpu-engine ../cuda-ray-tracer; do
+            if [ -d "$repo" ]; then
+              git -C "$repo" fetch --quiet
+              before=$(git -C "$repo" rev-parse HEAD)
+              git -C "$repo" pull --ff-only --quiet
+              after=$(git -C "$repo" rev-parse HEAD)
+              if [ "$before" != "$after" ] || [ ! -d "$repo/build" ]; then
+                cmake -S "$repo" -B "$repo/build" -DCMAKE_BUILD_TYPE=Release
+                cmake --build "$repo/build" -j
+              fi
+            else
+              echo "::warning::$repo not found on runner -- skipping its suite entries"
+            fi
+          done
+
+      - name: perflens run
+        id: run
+        run: |
+          perflens run --branch "${{ github.ref_name }}" --git-sha "${{ github.sha }}"
+          run_id=$(sqlite3 perflens.db "SELECT id FROM runs ORDER BY id DESC LIMIT 1;")
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: perflens detect
+        run: perflens detect --run "${{ steps.run.outputs.run_id }}" --json-out findings.json
+
+      - name: perflens triage
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          base_sha=$(git rev-parse HEAD~1)
+          perflens triage --run "${{ steps.run.outputs.run_id }}" \
+            --findings-json findings.json \
+            --base-sha "$base_sha" --head-sha "${{ github.sha }}" \
+            --out reports/triage.json
+
+      - name: perflens report --nightly
+        run: |
+          perflens report --run "${{ steps.run.outputs.run_id }}" \
+            --findings-json findings.json --triage-json reports/triage.json --nightly
+
+      - name: Commit report
+        run: |
+          git config user.name "perflens-bot"
+          git config user.email "perflens-bot@users.noreply.github.com"
+          git add reports/
+          git diff --cached --quiet || git commit -m "nightly: report for $(date -u +%F)"
+          git push
+
+      - name: Open issue on major findings
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if grep -q '\[MAJOR\]' <<< "$(perflens detect --run '${{ steps.run.outputs.run_id }}')"; then
+            report_file="reports/$(date -u +%F).md"
+            gh issue create \
+              --title "PerfLens: major regression detected $(date -u +%F)" \
+              --body-file "$report_file" \
+              --label "perf-regression"
+          fi
