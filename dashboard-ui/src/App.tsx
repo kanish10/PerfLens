@@ -29,18 +29,37 @@ export function App() {
     if (selectedRunId === null) return;
     setSelectedFinding(null);
     setHistory([]);
+    // Guards against out-of-order responses: if the user reselects a run
+    // before this request resolves, a stale response must not overwrite
+    // state that a newer, still-in-flight request will also try to set.
+    let stale = false;
     api
       .getFindings(selectedRunId)
-      .then(setFindings)
-      .catch((e: unknown) => setError(describeError(e)));
+      .then((f) => {
+        if (!stale) setFindings(f);
+      })
+      .catch((e: unknown) => {
+        if (!stale) setError(describeError(e));
+      });
+    return () => {
+      stale = true;
+    };
   }, [selectedRunId]);
 
   useEffect(() => {
     if (selectedFinding === null) return;
+    let stale = false;
     api
       .getMetricHistory(selectedFinding.entry, selectedFinding.kernel, selectedFinding.metric)
-      .then(setHistory)
-      .catch((e: unknown) => setError(describeError(e)));
+      .then((h) => {
+        if (!stale) setHistory(h);
+      })
+      .catch((e: unknown) => {
+        if (!stale) setError(describeError(e));
+      });
+    return () => {
+      stale = true;
+    };
   }, [selectedFinding]);
 
   return (

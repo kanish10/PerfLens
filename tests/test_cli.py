@@ -140,3 +140,61 @@ def test_detect_unknown_run_raises(project: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["detect", "--run", "999"])
     assert result.exit_code != 0
+
+
+def test_run_print_run_id_outputs_only_the_id(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(collect, "run_entry", _fake_run_entry([100.0] * 5))
+    runner = CliRunner()
+    result = runner.invoke(main, ["run", "--git-sha", "abc123", "--print-run-id"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "1"
+
+
+def test_baseline_set_entry_filter_scopes_to_one_entry(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    two_entry_suite = {
+        "gpu": "RTX 3060",
+        "reps": 5,
+        "entries": [
+            SUITE_YAML["entries"][0],
+            {
+                "name": "inference.fused_gelu",
+                "cwd": ".",
+                "cmd": "./build/bench_decode --once",
+                "kernel_regex": "bias_gelu.*",
+                "source_paths": ["src/gelu.cu"],
+            },
+        ],
+    }
+    (project / "suite.yaml").write_text(yaml.safe_dump(two_entry_suite))
+
+    def fake_run_entry_two(entry, reps, metrics=collect.METRIC_SET, ncu_path="ncu"):
+        kernel = "paged_attention_kernel" if "paged" in entry.name else "bias_gelu_kernel"
+        return [
+            KernelResultRecord(entry=entry.name, kernel=kernel, rep=i, duration_ns=100.0)
+            for i in range(5)
+        ]
+
+    monkeypatch.setattr(collect, "run_entry", fake_run_entry_two)
+    runner = CliRunner()
+    r1 = runner.invoke(main, ["run", "--git-sha", "abc123"])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = runner.invoke(
+        main, ["baseline", "set", "--run", "1", "--entry", "inference.paged_attention"]
+    )
+    assert r2.exit_code == 0, r2.output
+    assert "baseline set: 1" in r2.output  # only duration_ns for the one filtered entry
+
+    from perflens import store
+
+    conn = store.get_connection(project / "perflens.db")
+    baselined = store.get_baseline(
+        conn, "inference.paged_attention", "paged_attention_kernel", "duration_ns"
+    )
+    not_baselined = store.get_baseline(conn, "inference.fused_gelu", "bias_gelu_kernel", "duration_ns")
+    assert baselined is not None
+    assert not_baselined is None

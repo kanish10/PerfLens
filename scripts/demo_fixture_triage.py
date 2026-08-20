@@ -161,7 +161,12 @@ def main() -> None:
             )
         }
         ctx = triage.TriageContext(
-            conn=conn, entries=entries, findings=[FINDING], base_sha=base_sha, head_sha=head_sha
+            conn=conn,
+            entries=entries,
+            findings=[FINDING],
+            run_id=run_id,
+            base_sha=base_sha,
+            head_sha=head_sha,
         )
 
         print(f"Calling {args.model} to triage the hand-injected fixture finding...", file=sys.stderr)

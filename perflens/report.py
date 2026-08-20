@@ -16,7 +16,11 @@ def _default_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def _severity_badge(finding: Finding) -> str:
+def severity_label(finding: Finding) -> str:
+    """The one place that decides how a Finding's kind/severity renders as
+    text -- shared by the Markdown table and the CLI's plain-text table so
+    the two can't silently drift on what counts as "improvement" vs "?".
+    """
     if finding.kind == "improvement":
         return "IMPROVEMENT"
     return finding.severity.upper() if finding.severity else "?"
@@ -30,7 +34,7 @@ def _findings_table(findings: list[Finding]) -> str:
     rows = []
     for f in findings:
         rows.append(
-            f"| {_severity_badge(f)} | {f.entry} | `{f.kernel}` | {f.metric} | "
+            f"| {severity_label(f)} | {f.entry} | `{f.kernel}` | {f.metric} | "
             f"{f.base_median:,.0f} | {f.new_median:,.0f} | {f.delta_pct:+.2f}% |"
         )
     return header + "\n".join(rows) + "\n"
@@ -110,11 +114,21 @@ def write_report(path: str | Path, content: str) -> Path:
     return p
 
 
+def _run_gh(runner: CommandRunner, cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return runner(cmd)
+    except FileNotFoundError as exc:
+        # subprocess.run raises this (not a nonzero return code) when the
+        # binary isn't on PATH -- normalize it so every caller can catch a
+        # single RuntimeError regardless of which way `gh` is unavailable.
+        raise RuntimeError(f"'gh' not found on PATH: {exc}") from exc
+
+
 def post_pr_comment(
     pr_number: int, body: str, runner: CommandRunner = _default_runner
 ) -> subprocess.CompletedProcess[str]:
     """Post `body` as a comment on the given PR via `gh pr comment`."""
-    proc = runner(["gh", "pr", "comment", str(pr_number), "--body", body])
+    proc = _run_gh(runner, ["gh", "pr", "comment", str(pr_number), "--body", body])
     if proc.returncode != 0:
         raise RuntimeError(f"gh pr comment failed: {proc.stderr}")
     return proc
@@ -132,7 +146,8 @@ def set_commit_status(
     """
     if state not in {"error", "failure", "pending", "success"}:
         raise ValueError(f"invalid commit status state: {state}")
-    proc = runner(
+    proc = _run_gh(
+        runner,
         [
             "gh",
             "api",
@@ -143,7 +158,7 @@ def set_commit_status(
             f"description={description}",
             "-f",
             f"context={context}",
-        ]
+        ],
     )
     if proc.returncode != 0:
         raise RuntimeError(f"gh api statuses failed: {proc.stderr}")

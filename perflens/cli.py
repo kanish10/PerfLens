@@ -69,9 +69,8 @@ def _print_findings_table(findings: list[Finding]) -> None:
         click.echo("no findings against baseline")
         return
     for f in findings:
-        tag = "improvement" if f.kind == "improvement" else (f.severity or "?")
         click.echo(
-            f"[{tag.upper()}] {f.entry}/{f.kernel} {f.metric}: "
+            f"[{report.severity_label(f)}] {f.entry}/{f.kernel} {f.metric}: "
             f"{f.base_median:.0f} -> {f.new_median:.0f} ({f.delta_pct:+.2f}%)"
         )
 
@@ -95,8 +94,19 @@ def main() -> None:
 @click.option("--git-sha", default=None, help="Override detected git sha")
 @click.option("--entry", "entry_names", multiple=True, help="Restrict to specific suite entries")
 @click.option("--ncu-path", default="ncu", show_default=True)
+@click.option(
+    "--print-run-id",
+    is_flag=True,
+    help="Print only the new run id to stdout (for CI: run_id=$(perflens run ... --print-run-id))",
+)
 def run_cmd(
-    suite: str, db: str, branch: str | None, git_sha: str | None, entry_names: tuple[str, ...], ncu_path: str
+    suite: str,
+    db: str,
+    branch: str | None,
+    git_sha: str | None,
+    entry_names: tuple[str, ...],
+    ncu_path: str,
+    print_run_id: bool,
 ) -> None:
     """Collect the kernel suite (or a subset) into SQLite via Nsight Compute."""
     s = _load_suite(suite)
@@ -120,10 +130,15 @@ def run_cmd(
 
     total = 0
     for e in entries:
-        click.echo(f"collecting {e.name} ({s.reps} reps)...")
+        if not print_run_id:
+            click.echo(f"collecting {e.name} ({s.reps} reps)...")
         records = collect.run_entry(e, s.reps, ncu_path=ncu_path)
         total += store.insert_kernel_results(conn, run_id, records)
-    click.echo(f"run {run_id}: stored {total} kernel_results rows")
+
+    if print_run_id:
+        click.echo(str(run_id))
+    else:
+        click.echo(f"run {run_id}: stored {total} kernel_results rows")
 
 
 @main.group("baseline")
@@ -134,7 +149,13 @@ def baseline_group() -> None:
 @baseline_group.command("set")
 @click.option("--run", "run_id", required=True, type=int)
 @click.option("--db", default=DEFAULT_DB, show_default=True)
-def baseline_set(run_id: int, db: str) -> None:
+@click.option(
+    "--entry",
+    "entry_names",
+    multiple=True,
+    help="Restrict to specific suite entries (default: every entry in the run)",
+)
+def baseline_set(run_id: int, db: str, entry_names: tuple[str, ...]) -> None:
     """Write medians + MADs for every metric of every (entry, kernel) in a run."""
     conn = store.get_connection(db)
     store.init_db(conn)
@@ -142,9 +163,13 @@ def baseline_set(run_id: int, db: str) -> None:
     if run is None:
         raise click.ClickException(f"no such run: {run_id}")
 
+    entry_kernels = store.list_entry_kernels(conn, run_id)
+    if entry_names:
+        entry_kernels = [(e, k) for e, k in entry_kernels if e in entry_names]
+
     now = datetime.now(UTC).isoformat()
     count = 0
-    for entry, kernel in store.list_entry_kernels(conn, run_id):
+    for entry, kernel in entry_kernels:
         for metric, (median, mad) in store.compute_medians(conn, run_id, entry, kernel).items():
             store.set_baseline(conn, entry, kernel, metric, median, mad, run_id, now)
             count += 1
@@ -172,8 +197,14 @@ def detect_cmd(run_id: int, db: str, threshold: float, json_out: str | None) -> 
 @click.option("--db", default=DEFAULT_DB, show_default=True)
 @click.option("--suite", default=DEFAULT_SUITE, show_default=True)
 @click.option("--findings-json", default=None, type=click.Path(exists=True))
-@click.option("--base-sha", required=True)
-@click.option("--head-sha", required=True)
+@click.option(
+    "--base-sha",
+    default=None,
+    help="Override: normally each entry's source commits are resolved per-entry "
+    "from recorded history (see TriageContext.resolve_shas); only set this "
+    "together with --head-sha to force one pair for every entry",
+)
+@click.option("--head-sha", default=None, help="See --base-sha")
 @click.option("--model", default=triage.DEFAULT_MODEL, show_default=True)
 @click.option("--out", default=None, type=click.Path())
 def triage_cmd(
@@ -181,8 +212,8 @@ def triage_cmd(
     db: str,
     suite: str,
     findings_json: str | None,
-    base_sha: str,
-    head_sha: str,
+    base_sha: str | None,
+    head_sha: str | None,
     model: str,
     out: str | None,
 ) -> None:
@@ -194,7 +225,12 @@ def triage_cmd(
     findings = _load_findings(conn, run_id, findings_json)
 
     ctx = triage.TriageContext(
-        conn=conn, entries=entries, findings=findings, base_sha=base_sha, head_sha=head_sha
+        conn=conn,
+        entries=entries,
+        findings=findings,
+        run_id=run_id,
+        base_sha=base_sha,
+        head_sha=head_sha,
     )
     try:
         result = triage.run_triage(ctx, model=model)
@@ -288,10 +324,17 @@ def gate_cmd(
     if findings and not skip_triage:
         s = _load_suite(suite)
         entries = {e.name: e for e in s.entries}
-        head = head_sha or run["git_sha"]
-        base = base_sha or _git("rev-parse", f"{head}~1")
+        # base_sha/head_sha default to None -- each entry's source commits
+        # are then resolved per-entry from recorded history (see
+        # TriageContext.resolve_shas), since entries can live in different
+        # sibling repos with independent commit histories from this repo's.
         ctx = triage.TriageContext(
-            conn=conn, entries=entries, findings=findings, base_sha=base, head_sha=head
+            conn=conn,
+            entries=entries,
+            findings=findings,
+            run_id=run_id,
+            base_sha=base_sha,
+            head_sha=head_sha,
         )
         try:
             triage_report = triage.run_triage(ctx)

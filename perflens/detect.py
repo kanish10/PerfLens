@@ -27,22 +27,38 @@ _SECONDARY_UP_IS_BAD = {
 
 
 def _pct_delta(new: float, base: float) -> float:
+    """Percent change of `new` relative to `base`. `duration_ns`, the only
+    caller that feeds this into a gating decision, never legitimately
+    baselines at 0, so the 0.0 fallback is a defensive no-op there.
+    """
     if base == 0:
         return 0.0
     return (new - base) / base * 100.0
 
 
+def _pct_delta_or_none(new: float, base: float) -> float | None:
+    """Like _pct_delta, but for diagnostic-only secondary metrics that CAN
+    legitimately baseline at 0 (e.g. l2_hit_pct) -- there, a 0.0 fallback
+    would misreport "no change" for what's actually an undefined percentage
+    when the real change is 0 -> nonzero. None means undefined, not zero.
+    """
+    if base == 0:
+        return None if new != 0 else 0.0
+    return (new - base) / base * 100.0
+
+
 def _secondary_evidence(
     conn: sqlite3.Connection, run_id: int, entry: str, kernel: str, base_metrics: dict
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     new_metrics = store.compute_medians(conn, run_id, entry, kernel)
-    evidence: dict[str, float] = {}
+    evidence: dict[str, float | None] = {}
     for metric in _SECONDARY_UP_IS_BAD:
         if metric not in new_metrics or metric not in base_metrics:
             continue
         new_med, _ = new_metrics[metric]
         base_med, _ = base_metrics[metric]
-        evidence[f"{metric}_delta_pct"] = round(_pct_delta(new_med, base_med), 3)
+        delta = _pct_delta_or_none(new_med, base_med)
+        evidence[f"{metric}_delta_pct"] = round(delta, 3) if delta is not None else None
     return evidence
 
 
@@ -131,7 +147,11 @@ def detect_regressions(
                     evidence=evidence,
                     severity=None,
                     kind="improvement",
-                    suggested_command=f"perflens baseline set --run {run_id}",
+                    # Scoped to this one entry: `baseline set` with no --entry
+                    # filter would re-baseline every (entry, kernel) in the
+                    # run, silently masking any other still-unresolved
+                    # regression that happens to share this run.
+                    suggested_command=f"perflens baseline set --run {run_id} --entry {entry}",
                 )
             )
 

@@ -32,9 +32,19 @@ app.add_middleware(
 )
 
 
+# Schema setup is DDL (CREATE TABLE/INDEX) plus a commit -- run it once per
+# DB path the process has seen, not on every request. A concurrent CLI
+# writer (`perflens run`, `baseline set`) can hold the WAL write lock at any
+# moment; re-running DDL on every GET risks a transient "database is locked"
+# on requests that would otherwise be a plain, harmless read.
+_initialized_dbs: set[str] = set()
+
+
 def get_conn() -> Iterator[sqlite3.Connection]:
     conn = store.get_connection(DB_PATH)
-    store.init_db(conn)
+    if DB_PATH not in _initialized_dbs:
+        store.init_db(conn)
+        _initialized_dbs.add(DB_PATH)
     try:
         yield conn
     finally:

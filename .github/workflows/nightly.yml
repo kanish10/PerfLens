@@ -18,10 +18,11 @@ jobs:
     concurrency:
       group: perflens-gpu
       cancel-in-progress: false
+    env:
+      REF_NAME: ${{ github.ref_name }}
+      GIT_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # `perflens triage` diffs against HEAD~1; a shallow clone can't resolve it
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,7 +35,11 @@ jobs:
 
       - name: Build suite dependencies if HEAD moved
         # gpu-engine and cuda-ray-tracer are pinned sibling checkouts on the
-        # runner box (see suite.yaml). Only rebuild what changed.
+        # runner box (see suite.yaml). Only rebuild what changed. `perflens
+        # run` records each entry's own repo HEAD (source_sha) at collection
+        # time, so the triage agent later diffs the *correct* sibling-repo
+        # commits automatically -- this step doesn't need to plumb before/
+        # after SHAs through to later steps by hand.
         run: |
           for repo in ../gpu-engine ../cuda-ray-tracer; do
             if [ -d "$repo" ]; then
@@ -54,9 +59,18 @@ jobs:
       - name: perflens run
         id: run
         run: |
-          perflens run --branch "${{ github.ref_name }}" --git-sha "${{ github.sha }}"
-          run_id=$(python -c "import sqlite3; print(sqlite3.connect('perflens.db').execute('SELECT id FROM runs ORDER BY id DESC LIMIT 1').fetchone()[0])")
+          run_id=$(perflens run --branch "$REF_NAME" --git-sha "$GIT_SHA" --print-run-id)
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          # Captured once, here, and reused by every later step -- so the
+          # report filename can't drift if a slow triage call pushes later
+          # steps past UTC midnight (`date -u +%F` re-evaluated per-step
+          # would silently disagree with what `perflens report` already wrote).
+          report_date=$(python -c "
+          import sqlite3
+          row = sqlite3.connect('perflens.db').execute('SELECT ts FROM runs WHERE id = ?', ($run_id,)).fetchone()
+          print(row[0][:10])
+          ")
+          echo "report_date=$report_date" >> "$GITHUB_OUTPUT"
 
       - name: perflens detect
         run: perflens detect --run "${{ steps.run.outputs.run_id }}" --json-out findings.json
@@ -64,29 +78,38 @@ jobs:
       - name: perflens triage
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # Non-fatal on purpose: `perflens report` degrades gracefully with no
+        # --triage-json (findings-only report, no agent narrative), and a
+        # triage failure (expired key, rate limit, agent timeout) must not
+        # also swallow the report/commit/issue-creation steps below -- those
+        # already have everything they need from findings.json regardless.
         run: |
-          base_sha=$(git rev-parse HEAD~1)
           perflens triage --run "${{ steps.run.outputs.run_id }}" \
             --findings-json findings.json \
-            --base-sha "$base_sha" --head-sha "${{ github.sha }}" \
-            --out reports/triage.json
+            --out reports/triage.json \
+          || echo "::warning::triage failed, continuing with a findings-only report"
 
       - name: perflens report --nightly
         run: |
+          triage_flag=()
+          if [ -f reports/triage.json ]; then
+            triage_flag=(--triage-json reports/triage.json)
+          fi
           perflens report --run "${{ steps.run.outputs.run_id }}" \
-            --findings-json findings.json --triage-json reports/triage.json --nightly
+            --findings-json findings.json "${triage_flag[@]}" --nightly
 
       - name: Commit report
         run: |
           git config user.name "perflens-bot"
           git config user.email "perflens-bot@users.noreply.github.com"
           git add reports/
-          git diff --cached --quiet || git commit -m "nightly: report for $(date -u +%F)"
+          git diff --cached --quiet || git commit -m "nightly: report for ${{ steps.run.outputs.report_date }}"
           git push
 
       - name: Open issue on major findings
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT_DATE: ${{ steps.run.outputs.report_date }}
         run: |
           major_count=$(python -c "
           import json
@@ -95,7 +118,7 @@ jobs:
           ")
           if [ "$major_count" -gt 0 ]; then
             gh issue create \
-              --title "PerfLens: $major_count major regression(s) detected $(date -u +%F)" \
-              --body-file "reports/$(date -u +%F).md" \
+              --title "PerfLens: $major_count major regression(s) detected $REPORT_DATE" \
+              --body-file "reports/$REPORT_DATE.md" \
               --label "perf-regression"
           fi

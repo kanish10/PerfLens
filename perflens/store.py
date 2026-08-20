@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS kernel_results(
   block_size INTEGER,
   grid_size INTEGER,
   ipc REAL,
+  source_sha TEXT,
   raw_json TEXT
 );
 
@@ -106,6 +107,7 @@ def insert_kernel_results(
             r.block_size,
             r.grid_size,
             r.ipc,
+            r.source_sha,
             json.dumps(r.raw, sort_keys=True),
         )
         for r in records
@@ -113,8 +115,8 @@ def insert_kernel_results(
     conn.executemany(
         """INSERT INTO kernel_results(
              run_id, entry, kernel, rep, duration_ns, occupancy_pct, dram_pct,
-             l2_hit_pct, regs_per_thread, block_size, grid_size, ipc, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             l2_hit_pct, regs_per_thread, block_size, grid_size, ipc, source_sha, raw_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
     conn.commit()
@@ -123,6 +125,19 @@ def insert_kernel_results(
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def get_entry_source_sha(conn: sqlite3.Connection, run_id: int, entry: str) -> str | None:
+    """The HEAD of `entry`'s own source repo (SuiteEntry.cwd) recorded at
+    collection time for this run -- distinct from runs.git_sha, which is
+    this repo's own commit. Different entries can live in different sibling
+    repos with independent histories (see suite.yaml).
+    """
+    row = conn.execute(
+        "SELECT source_sha FROM kernel_results WHERE run_id = ? AND entry = ? LIMIT 1",
+        (run_id, entry),
+    ).fetchone()
+    return row["source_sha"] if row is not None else None
 
 
 def get_latest_run(conn: sqlite3.Connection, branch: str | None = None) -> sqlite3.Row | None:

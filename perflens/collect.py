@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import io
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -83,7 +84,7 @@ def build_ncu_command(entry: SuiteEntry, reps: int, metrics: tuple[str, ...] = M
         "--metrics",
         ",".join(metrics),
         "--",
-        *entry.cmd.split(),
+        *shlex.split(entry.cmd),
     ]
 
 
@@ -123,9 +124,14 @@ def parse_ncu_csv(csv_text: str) -> list[RawKernelRow]:
     return [rows_by_id[i] for i in order]
 
 
-def to_kernel_results(entry_name: str, rows: list[RawKernelRow]) -> list[KernelResultRecord]:
+def to_kernel_results(
+    entry_name: str, rows: list[RawKernelRow], source_sha: str | None = None
+) -> list[KernelResultRecord]:
     """Group raw per-launch rows by kernel name and assign rep indices in
     file order (launch-skip already dropped warmup iterations upstream).
+
+    `source_sha` is the HEAD of the entry's own source repo (SuiteEntry.cwd),
+    not this repo's git sha -- it's what the triage agent later diffs against.
     """
     rep_counters: dict[str, int] = {}
     out: list[KernelResultRecord] = []
@@ -164,10 +170,19 @@ def to_kernel_results(entry_name: str, rows: list[RawKernelRow]) -> list[KernelR
                 regs_per_thread=ints.get("regs_per_thread"),
                 block_size=ints.get("block_size"),
                 grid_size=ints.get("grid_size"),
+                source_sha=source_sha,
                 raw=dict(row.metrics),
             )
         )
     return out
+
+
+def _git_sha(cwd: str) -> str | None:
+    """HEAD of the repo at `cwd`, or None if it isn't a git checkout."""
+    proc = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
 
 
 def run_entry(
@@ -198,4 +213,4 @@ def run_entry(
         )
 
     rows = parse_ncu_csv(proc.stdout)
-    return to_kernel_results(entry.name, rows)
+    return to_kernel_results(entry.name, rows, source_sha=_git_sha(entry.cwd))

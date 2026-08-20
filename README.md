@@ -104,12 +104,16 @@ perflens run --branch main                       # collect the whole suite
 perflens baseline set --run 1                     # seed a baseline from run 1
 perflens run --branch main                        # a second run to compare
 perflens detect --run 2                           # print findings vs. baseline
-perflens triage --run 2 --base-sha <a> --head-sha <b>   # needs ANTHROPIC_API_KEY
+perflens triage --run 2                           # needs ANTHROPIC_API_KEY
 perflens report --run 2 --nightly                 # render reports/YYYY-MM-DD.md
 perflens gate --run 2 --pr 42                      # detect+triage+report+gate, exit 1 on major
 ```
 
-`perflens --help` and `perflens <command> --help` document every flag.
+`perflens triage`/`gate` don't take `--base-sha`/`--head-sha` in the normal
+path -- each suite entry's own source commits are resolved automatically per
+entry (see "How the triage agent works" below); those flags exist only to
+force one explicit pair, which is only correct when every entry shares one
+repo. `perflens --help` and `perflens <command> --help` document every flag.
 
 ## How detection works
 
@@ -147,7 +151,28 @@ outside the kernel that actually regressed. It never gets write access to the
 repo, the database, or CI. Its final answer is forced through a
 `submit_triage_report` tool with a strict JSON schema, so the output is
 always a validated Pydantic `TriageReport`, never freeform prose that a
-downstream renderer has to parse hopefully.
+downstream renderer has to parse hopefully. Only `regression` findings go to
+the agent -- an `improvement` has no severity to report and no root cause to
+explain, and forcing one through the same schema would make the agent invent
+a severity that isn't there.
+
+**Resolving the right source commits across sibling repos.** A suite entry's
+kernel source doesn't live in this repo -- `suite.yaml`'s `cwd` points at a
+sibling checkout (`../gpu-engine`, `../cuda-ray-tracer`), each with its own
+independent commit history that shares no SHA namespace with this repo or
+with each other. So `get_kernel_diff`/`get_commit_log` don't take `base_sha`/
+`head_sha` as agent-supplied arguments -- the agent can't know the right
+values for a repo it's never seen, and asking it to guess (or reusing this
+repo's own `git rev-parse HEAD~1`, which an earlier version of this pipeline
+did) surfaces the wrong repo's commits or a "bad revision" tool error on
+every real finding. Instead, `collect.py` records each entry's own repo HEAD
+(`source_sha`) alongside every measurement at collection time, and
+`TriageContext.resolve_shas` looks up, per entry: `head` = this run's
+recorded `source_sha` for that entry, `base` = the `source_sha` recorded for
+that entry in whichever run its baseline was set from. The agent just names
+the `entry`; the correct commit pair for that entry's own repo comes back
+automatically. `tests/test_triage.py::test_resolve_shas_uses_recorded_source_sha_not_this_repos_history`
+is the regression test for this.
 
 The system prompt asks for, per finding: severity (as set by the detector),
 an evidence summary quoting exact metric deltas, a root-cause hypothesis tied
@@ -188,6 +213,23 @@ Per `CLAUDE.md` hard constraint #4:
    if `ncu` exits nonzero for permission reasons.
 6. Clone `gpu-engine` and `cuda-ray-tracer` as siblings of this repo's
    checkout on the runner box, matching the `cwd` paths in `suite.yaml`.
+
+**Known gap, stated plainly rather than papered over:** `pr-gate.yml`
+triggers on PRs to *this* repo, but a real kernel regression (M6's
+`demo-regression` scenario) is a commit in a *sibling* repo (`gpu-engine` or
+`cuda-ray-tracer`) -- `CLAUDE.md` doesn't specify how one repo's PR is
+supposed to make the other repo's sibling checkout advance to the matching
+commit before `perflens run` executes. `nightly.yml` sidesteps this (it just
+pulls whatever is latest on each sibling repo's default branch on its own
+schedule), but `pr-gate.yml` as written assumes the sibling checkouts are
+already sitting at the commit under test. Until the actual M6 case study
+pins this down, the working assumption is: a demo regression PR would go
+against `gpu-engine`, and either `gpu-engine`'s own CI cross-triggers this
+workflow (`repository_dispatch` / `workflow_dispatch` with the target SHA),
+or a maintainer updates the sibling checkout by hand before applying the
+`perf` label. `perflens triage` itself is correct regardless of how the
+sibling repo got to that commit -- see "How the triage agent works" above --
+it's specifically the cross-repo *trigger* plumbing that's unbuilt.
 
 ## Dashboard (M7 stretch)
 

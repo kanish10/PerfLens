@@ -28,3 +28,5 @@ dashboard-ui/dist/
 *.tsbuildinfo
 
 .DS_Store
+
+.claude/

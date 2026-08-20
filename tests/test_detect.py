@@ -96,6 +96,9 @@ def test_improvement_path(conn: sqlite3.Connection, make_run) -> None:
     assert f.delta_pct < 0
     assert f.suggested_command is not None
     assert "baseline set" in f.suggested_command
+    # Scoped to this entry -- must not re-baseline every kernel in the run
+    # and risk masking some other, unrelated, still-unresolved regression.
+    assert f"--entry {ENTRY}" in f.suggested_command
 
 
 def test_minor_vs_major_severity_boundary(conn: sqlite3.Connection, make_run) -> None:
@@ -165,6 +168,35 @@ def test_secondary_metrics_attached_as_evidence_never_gate_alone(
     evidence = findings[0].evidence
     assert evidence["occupancy_pct_delta_pct"] < 0
     assert evidence["regs_per_thread_delta_pct"] > 0
+
+
+def test_secondary_evidence_zero_baseline_is_undefined_not_zero(
+    conn: sqlite3.Connection, make_run
+) -> None:
+    """A metric that legitimately baselines at 0 (e.g. l2_hit_pct on a
+    kernel with zero cache hits) must not report a misleading 0.0 delta --
+    that would read as "unchanged" when the real change is undefined.
+    """
+    base_run = make_run(ts="2026-01-01T00:00:00+00:00")
+    base_records = [
+        KernelResultRecord(entry=ENTRY, kernel=KERNEL, rep=i, duration_ns=100.0, l2_hit_pct=0.0)
+        for i in range(5)
+    ]
+    store.insert_kernel_results(conn, base_run, base_records)
+    for metric in ("duration_ns", "l2_hit_pct"):
+        median, mad = store.compute_medians(conn, base_run, ENTRY, KERNEL)[metric]
+        store.set_baseline(conn, ENTRY, KERNEL, metric, median, mad, base_run, "2026-01-01T00:00:00+00:00")
+
+    regression_run = make_run(ts="2026-01-02T00:00:00+00:00")
+    reg_records = [
+        KernelResultRecord(entry=ENTRY, kernel=KERNEL, rep=i, duration_ns=130.0, l2_hit_pct=45.0)
+        for i in range(5)
+    ]
+    store.insert_kernel_results(conn, regression_run, reg_records)
+
+    findings = detect.detect_regressions(conn, regression_run)
+    assert len(findings) == 1
+    assert findings[0].evidence["l2_hit_pct_delta_pct"] is None
 
 
 def test_gpu_driver_mismatch_skips_comparison(conn: sqlite3.Connection, make_run) -> None:

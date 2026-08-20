@@ -78,13 +78,40 @@ class TriageContext:
     conn: Connection
     entries: dict[str, SuiteEntry]
     findings: list[Finding]
-    base_sha: str
-    head_sha: str
+    run_id: int
+    # Explicit overrides. Leave unset (the normal path): each entry's source
+    # commits are resolved per-entry from recorded source_sha history, since
+    # different entries can live in different sibling repos (see suite.yaml)
+    # with independent commit histories -- there is no single (base_sha,
+    # head_sha) pair that's valid across all of them.
+    base_sha: str | None = None
+    head_sha: str | None = None
 
     def entry(self, name: str) -> SuiteEntry:
         if name not in self.entries:
             raise KeyError(f"unknown suite entry: {name}")
         return self.entries[name]
+
+    def resolve_shas(self, entry_name: str) -> tuple[str | None, str | None]:
+        """(base_sha, head_sha) for one entry's own source repo.
+
+        Explicit overrides win when both are set. Otherwise: head is the
+        source_sha recorded for this entry in this run; base is the
+        source_sha recorded for this entry in whichever run the entry's
+        (entry, kernel) baseline was set from. Never falls back to this
+        repo's (PerfLens's) own git history -- that repo is not where the
+        kernel source lives.
+        """
+        if self.base_sha is not None and self.head_sha is not None:
+            return self.base_sha, self.head_sha
+        head = store.get_entry_source_sha(self.conn, self.run_id, entry_name)
+        base = None
+        finding = next((f for f in self.findings if f.entry == entry_name), None)
+        if finding is not None:
+            baseline = store.get_baseline(self.conn, entry_name, finding.kernel, "duration_ns")
+            if baseline is not None:
+                base = store.get_entry_source_sha(self.conn, baseline["run_id"], entry_name)
+        return base, head
 
 
 def _tool_defs() -> list[dict[str, Any]]:
@@ -115,31 +142,29 @@ def _tool_defs() -> list[dict[str, Any]]:
         {
             "name": "get_kernel_diff",
             "description": (
-                "Unified source diff between base_sha and head_sha, "
-                "limited to the entry's source_paths."
+                "Unified source diff for this entry, limited to its source_paths, "
+                "between its baseline run's source commit and this run's source "
+                "commit. The correct commits for this entry's own repo are "
+                "resolved automatically -- you only supply the entry name."
             ),
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "entry": {"type": "string"},
-                    "base_sha": {"type": "string"},
-                    "head_sha": {"type": "string"},
-                },
-                "required": ["entry", "base_sha", "head_sha"],
+                "properties": {"entry": {"type": "string"}},
+                "required": ["entry"],
                 "additionalProperties": False,
             },
         },
         {
             "name": "get_commit_log",
-            "description": "Commits touching the entry's source_paths between base_sha and head_sha.",
+            "description": (
+                "Commits touching this entry's source_paths between its baseline "
+                "run's source commit and this run's source commit. The correct "
+                "commits for this entry's own repo are resolved automatically."
+            ),
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "entry": {"type": "string"},
-                    "base_sha": {"type": "string"},
-                    "head_sha": {"type": "string"},
-                },
-                "required": ["entry", "base_sha", "head_sha"],
+                "properties": {"entry": {"type": "string"}},
+                "required": ["entry"],
                 "additionalProperties": False,
             },
         },
@@ -198,32 +223,43 @@ def _dispatch(ctx: TriageContext, name: str, tool_input: dict[str, Any]) -> tupl
             return json.dumps(history), False
         if name == "get_kernel_diff":
             entry = ctx.entry(tool_input["entry"])
-            diff = gitctx.get_kernel_diff(
-                entry.cwd, tool_input["base_sha"], tool_input["head_sha"], entry.source_paths
-            )
+            base_sha, head_sha = ctx.resolve_shas(tool_input["entry"])
+            if not base_sha or not head_sha:
+                return (
+                    "no recorded source commit for this entry (baseline or current "
+                    "run predates source_sha tracking, or the entry's cwd isn't a "
+                    "git checkout) -- cannot diff; treat this as inconclusive, not "
+                    "as evidence of no change",
+                    True,
+                )
+            diff = gitctx.get_kernel_diff(entry.cwd, base_sha, head_sha, entry.source_paths)
             return diff, False
         if name == "get_commit_log":
             entry = ctx.entry(tool_input["entry"])
-            log = gitctx.get_commit_log(
-                entry.cwd, tool_input["base_sha"], tool_input["head_sha"], entry.source_paths
-            )
+            base_sha, head_sha = ctx.resolve_shas(tool_input["entry"])
+            if not base_sha or not head_sha:
+                return "no recorded source commit for this entry -- cannot list commits", True
+            log = gitctx.get_commit_log(entry.cwd, base_sha, head_sha, entry.source_paths)
             return json.dumps(log), False
         return f"unknown tool: {name}", True
     except Exception as exc:  # noqa: BLE001 - surfaced to the model as a tool error
         return f"error: {exc}", True
 
 
-def _initial_prompt(ctx: TriageContext) -> str:
-    lines = [
-        f"base_sha={ctx.base_sha} head_sha={ctx.head_sha}",
-        "Findings to triage (also available via get_findings):",
-    ]
-    for f in ctx.findings:
+def _initial_prompt(ctx: TriageContext, findings: list[Finding]) -> str:
+    lines = ["Findings to triage (also available via get_findings):"]
+    for f in findings:
+        base_sha, head_sha = ctx.resolve_shas(f.entry)
         lines.append(
             f"- [{f.kind}] {f.entry}/{f.kernel}: {f.metric} {f.base_median:.0f} -> "
-            f"{f.new_median:.0f} ({f.delta_pct:+.2f}%), evidence={f.evidence}"
+            f"{f.new_median:.0f} ({f.delta_pct:+.2f}%), evidence={f.evidence}, "
+            f"source commits: base={base_sha or 'unknown'} head={head_sha or 'unknown'}"
         )
-    lines.append("\nInvestigate each finding, then call submit_triage_report.")
+    lines.append(
+        "\nFor get_kernel_diff/get_commit_log, pass just the entry name -- the "
+        "correct source commits for that entry's own repo are resolved for you. "
+        "Investigate each finding, then call submit_triage_report."
+    )
     return "\n".join(lines)
 
 
@@ -240,29 +276,42 @@ def run_triage(
     model: str = DEFAULT_MODEL,
     max_iterations: int = MAX_ITERATIONS,
 ) -> TriageReport:
-    if not ctx.findings:
+    # Improvements have no severity to report and no root cause to explain --
+    # only regressions go to the agent. submit_triage_report's schema requires
+    # severity in {minor, major}, which an improvement (severity=None) can't
+    # satisfy without the agent fabricating a value.
+    regression_findings = [f for f in ctx.findings if f.kind == "regression"]
+    if not regression_findings:
         return TriageReport(findings=[], model=model, generated_at=datetime.now(UTC).isoformat())
 
     active_client: AnthropicLike
     if client is None:
-        import anthropic
+        try:
+            import anthropic
 
-        active_client = cast("AnthropicLike", anthropic.Anthropic())
+            active_client = cast("AnthropicLike", anthropic.Anthropic())
+        except Exception as exc:  # noqa: BLE001 - normalize any SDK/env error
+            raise TriageError(f"could not construct Anthropic client: {exc}") from exc
     else:
         active_client = client
 
     tools = _tool_defs()
-    messages: list[dict[str, Any]] = [{"role": "user", "content": _initial_prompt(ctx)}]
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": _initial_prompt(ctx, regression_findings)}
+    ]
 
     for _ in range(max_iterations):
-        response = active_client.messages.create(
-            model=model,
-            max_tokens=8000,
-            system=SYSTEM_PROMPT,
-            tools=tools,
-            thinking={"type": "adaptive"},
-            messages=messages,
-        )
+        try:
+            response = active_client.messages.create(
+                model=model,
+                max_tokens=8000,
+                system=SYSTEM_PROMPT,
+                tools=tools,
+                thinking={"type": "adaptive"},
+                messages=messages,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize any SDK error (auth, rate limit, ...)
+            raise TriageError(f"Claude API call failed: {exc}") from exc
 
         tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
         submit_call = next((b for b in tool_uses if b.name == "submit_triage_report"), None)

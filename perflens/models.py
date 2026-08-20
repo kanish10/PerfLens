@@ -41,6 +41,10 @@ class KernelResultRecord(BaseModel):
     block_size: int | None = None
     grid_size: int | None = None
     ipc: float | None = None
+    # HEAD of the entry's own source repo (SuiteEntry.cwd) at collection time --
+    # NOT this repo's git_sha. Different entries can live in different sibling
+    # repos (see suite.yaml), each with its own independent commit history.
+    source_sha: str | None = None
     raw: dict[str, str] = Field(default_factory=dict)
 
 
@@ -64,7 +68,10 @@ class Finding(BaseModel):
     base_median: float
     new_median: float
     delta_pct: float
-    evidence: dict[str, float] = Field(default_factory=dict)
+    # A metric that legitimately baselines at 0 (e.g. l2_hit_pct) makes a
+    # percent delta undefined rather than 0 -- None means "undefined", not
+    # "unchanged". See detect._pct_delta.
+    evidence: dict[str, float | None] = Field(default_factory=dict)
     severity: Severity | None = None
     kind: FindingKind
     suggested_command: str | None = None

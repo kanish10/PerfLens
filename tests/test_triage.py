@@ -101,7 +101,7 @@ def ctx(conn: sqlite3.Connection, repo: Path, finding: Finding) -> triage.Triage
         )
     }
     return triage.TriageContext(
-        conn=conn, entries=entries, findings=[finding], base_sha=base_sha, head_sha=head_sha
+        conn=conn, entries=entries, findings=[finding], run_id=1, base_sha=base_sha, head_sha=head_sha
     )
 
 
@@ -125,11 +125,7 @@ def _submit_block(**overrides: Any) -> FakeBlock:
 def test_triage_produces_schema_valid_report_after_gathering_evidence(
     ctx: triage.TriageContext,
 ) -> None:
-    tool_call_input = {
-        "entry": "inference.paged_attention",
-        "base_sha": ctx.base_sha,
-        "head_sha": ctx.head_sha,
-    }
+    tool_call_input = {"entry": "inference.paged_attention"}
     scripted = [
         FakeResponse(
             content=[
@@ -228,7 +224,7 @@ def test_triage_dispatches_get_findings_and_metric_history(ctx: triage.TriageCon
 def test_triage_empty_findings_short_circuits_without_calling_model(
     conn: sqlite3.Connection,
 ) -> None:
-    ctx = triage.TriageContext(conn=conn, entries={}, findings=[], base_sha="a", head_sha="b")
+    ctx = triage.TriageContext(conn=conn, entries={}, findings=[], run_id=1, base_sha="a", head_sha="b")
     client = FakeClient([])  # would raise AssertionError if called
 
     result = triage.run_triage(ctx, client=client)
@@ -255,6 +251,134 @@ def test_triage_raises_on_invalid_submit_payload(ctx: triage.TriageContext) -> N
 
     with pytest.raises(triage.TriageError):
         triage.run_triage(ctx, client=client)
+
+
+def test_resolve_shas_uses_recorded_source_sha_not_this_repos_history(
+    conn: sqlite3.Connection, repo: Path, finding: Finding
+) -> None:
+    """Regression test: base_sha/head_sha must come from the entry's OWN
+    recorded source_sha history (per (entry, its cwd repo)), never from a
+    single global pair borrowed from a different repo's history -- entries
+    can live in sibling repos (see suite.yaml) with independent commits that
+    share no SHA namespace with this repo or with each other.
+    """
+    from perflens import store
+    from perflens.models import KernelResultRecord, RunInfo
+
+    base_sha, head_sha = _shas(repo)
+
+    baseline_run_id = store.insert_run(
+        conn,
+        RunInfo(
+            ts="2026-01-01T00:00:00+00:00", git_sha="unrelated-perflens-sha-1", branch="main",
+            gpu="RTX 3060", driver="550", cuda_version="12.4", suite_hash="h",
+        ),
+    )
+    store.insert_kernel_results(
+        conn,
+        baseline_run_id,
+        [
+            KernelResultRecord(
+                entry="inference.paged_attention", kernel="paged_attention_kernel",
+                rep=i, duration_ns=12450.0, source_sha=base_sha,
+            )
+            for i in range(5)
+        ],
+    )
+    store.set_baseline(
+        conn, "inference.paged_attention", "paged_attention_kernel", "duration_ns",
+        12450.0, 10.0, baseline_run_id, "2026-01-01T00:00:00+00:00",
+    )
+
+    current_run_id = store.insert_run(
+        conn,
+        RunInfo(
+            ts="2026-01-02T00:00:00+00:00", git_sha="unrelated-perflens-sha-2", branch="main",
+            gpu="RTX 3060", driver="550", cuda_version="12.4", suite_hash="h",
+        ),
+    )
+    store.insert_kernel_results(
+        conn,
+        current_run_id,
+        [
+            KernelResultRecord(
+                entry="inference.paged_attention", kernel="paged_attention_kernel",
+                rep=i, duration_ns=15600.0, source_sha=head_sha,
+            )
+            for i in range(5)
+        ],
+    )
+
+    entries = {
+        "inference.paged_attention": SuiteEntry(
+            name="inference.paged_attention",
+            cwd=str(repo),
+            cmd="./build/bench_decode --once",
+            kernel_regex="paged_attention.*",
+            source_paths=["src/attention.cu"],
+        )
+    }
+    # No base_sha/head_sha override -- must resolve from recorded history.
+    ctx = triage.TriageContext(
+        conn=conn, entries=entries, findings=[finding], run_id=current_run_id
+    )
+
+    resolved_base, resolved_head = ctx.resolve_shas("inference.paged_attention")
+    assert resolved_base == base_sha
+    assert resolved_head == head_sha
+
+    scripted = [
+        FakeResponse(
+            content=[
+                FakeBlock(
+                    type="tool_use",
+                    name="get_kernel_diff",
+                    input={"entry": "inference.paged_attention"},
+                    id="c1",
+                ),
+            ]
+        ),
+        FakeResponse(content=[_submit_block()]),
+    ]
+    client = FakeClient(scripted)
+
+    result = triage.run_triage(ctx, client=client)
+    assert len(result.findings) == 1
+
+    tool_result_msg = client.messages.calls[1]["messages"][-1]
+    diff_result = next(r["content"] for r in tool_result_msg["content"] if r["tool_use_id"] == "c1")
+    assert "int x[64]" in diff_result  # the real injected regression, from the real diff range
+
+
+def test_resolve_shas_returns_none_when_no_source_sha_recorded(
+    conn: sqlite3.Connection,
+) -> None:
+    ctx = triage.TriageContext(conn=conn, entries={}, findings=[], run_id=1)
+    base, head = ctx.resolve_shas("some.entry")
+    assert base is None
+    assert head is None
+
+
+def test_triage_skips_improvement_findings_without_calling_model(
+    conn: sqlite3.Connection,
+) -> None:
+    improvement = Finding(
+        entry="raytracer.trace",
+        kernel="trace_rays_kernel",
+        base_median=9000.0,
+        new_median=7000.0,
+        delta_pct=-22.2,
+        evidence={},
+        severity=None,
+        kind="improvement",
+        suggested_command="perflens baseline set --run 1 --entry raytracer.trace",
+    )
+    ctx = triage.TriageContext(conn=conn, entries={}, findings=[improvement], run_id=1)
+    client = FakeClient([])  # would raise AssertionError if called
+
+    result = triage.run_triage(ctx, client=client)
+
+    assert result.findings == []
 
 
 def test_triage_tool_error_surfaces_as_is_error(ctx: triage.TriageContext) -> None:
