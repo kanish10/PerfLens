@@ -286,12 +286,22 @@ def run_triage(
 
     active_client: AnthropicLike
     if client is None:
-        try:
-            import anthropic
+        if model.startswith("claude-"):
+            try:
+                import anthropic
 
-            active_client = cast("AnthropicLike", anthropic.Anthropic())
-        except Exception as exc:  # noqa: BLE001 - normalize any SDK/env error
-            raise TriageError(f"could not construct Anthropic client: {exc}") from exc
+                active_client = cast("AnthropicLike", anthropic.Anthropic())
+            except Exception as exc:  # noqa: BLE001 - normalize any SDK/env error
+                raise TriageError(f"could not construct Anthropic client: {exc}") from exc
+        else:
+            # Non-Anthropic model name (e.g. "llama-3.3-70b-versatile") routes
+            # to Groq's OpenAI-compatible API via groq_adapter.GroqAdapterClient.
+            try:
+                from perflens.groq_adapter import GroqAdapterClient
+
+                active_client = cast("AnthropicLike", GroqAdapterClient())
+            except Exception as exc:  # noqa: BLE001 - normalize any SDK/env error
+                raise TriageError(f"could not construct Groq client: {exc}") from exc
     else:
         active_client = client
 

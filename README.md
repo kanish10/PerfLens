@@ -13,27 +13,92 @@ design spec this repo implements.
 
 ## Status
 
-This repo currently ships the **full pipeline** (M1-M5 from `CLAUDE.md`) with
-committed, passing tests -- but honestly, not everything in `CLAUDE.md` can be
-*proven* from a laptop with no NVIDIA GPU, no Nsight Compute, and no
-self-hosted runner attached, and `CLAUDE.md`'s hard constraint #1 is explicit
-that the README case study must be a real caught regression, never a mockup.
-So here's exactly where things stand:
-
 | Milestone | Status | Evidence |
 |---|---|---|
 | M1: collect one suite entry -> SQLite | **Done** | `perflens/collect.py`, `tests/test_collect_parse.py` (fixture ncu CSV) |
 | M2: full suite + `baseline set` + reps | **Done** | `perflens/store.py`, `perflens/cli.py`, `tests/test_store.py`, `tests/test_cli.py` |
 | M3: detector green on synthetic tests | **Done** | `perflens/detect.py`, `tests/test_detect.py` (clean regression / noise / high-MAD / improvement cases from the spec) |
-| M4: triage agent, schema-valid report on a hand-injected fixture | **Done** | `perflens/triage.py`, `tests/test_triage.py` (stubbed client, runs in CI); `scripts/demo_fixture_triage.py` (same scenario against the *real* Claude API -- requires `ANTHROPIC_API_KEY`, not run in this environment, output intentionally not committed) |
-| M5: nightly workflow, two unattended nights on the self-hosted runner | **Pending hardware** | `.github/workflows/nightly.yml` is written and YAML-valid, but has no self-hosted runner to execute on yet |
-| M6: the README case study (real regression, real agent report) | **Pending hardware** | Cannot be produced without the RTX 3060 box + Nsight Compute + the paired `gpu-engine`/`cuda-ray-tracer` checkouts. **Deliberately not faked.** Once the runner is online, `git checkout -b demo-regression`, introduce a real regression (e.g. drop `__restrict__` or add per-thread locals to force spills), let `pr-gate.yml` catch it, and paste the real report below. |
+| M4: triage agent, schema-valid report on a hand-injected fixture | **Done** | `perflens/triage.py`, `tests/test_triage.py` (stubbed client, runs in CI) |
+| M5: nightly workflow, two unattended nights on the self-hosted runner | **Pipeline verified on real hardware; two-night unattended run not yet done** | See "M6 case study" below -- the full `run`->`baseline`->`run`->`detect`->`triage`->`report` pipeline was executed for real on a rented RTX 3060. What's still open is literally two nights of the cron actually firing unattended, which needs a runner kept online, not further engineering. |
+| M6: the README case study (real regression, real agent report) | **Done** | See below. Real regression, real detector finding, real agent report -- no mockups. |
 | M7 (stretch): wall-clock ingestion + dashboard | **Dashboard done, wall-clock ingestion not started** | `perflens/dashboard/` (FastAPI) + `dashboard-ui/` (React), both read real SQLite data; bench_decode CSV ingestion is future work |
 
-**Why this matters:** every synthetic/fixture test in this repo runs in CI
-against fake-but-realistic data and proves the *logic* is correct. None of
-them are a substitute for M6. When the case study lands, it replaces this
-whole section with the real branch, the real PR, and the real agent output.
+## M6 case study: a real caught regression
+
+Everything below happened on a rented RTX 3060 (Vast.ai VM instance, not a
+container -- Nsight Compute needs kernel-level counter access that container
+instances don't grant), against real sibling checkouts of
+[`gpu-engine`](https://github.com/kanish10/LLM-Inference-Server/tree/main/gpu-engine)
+and [`cuda-ray-tracer`](https://github.com/kanish10/Ray-Tracer). Nothing here
+is fixture data.
+
+**The regression.** On a `demo-regression` branch of `gpu-engine`,
+[`paged_attention_kernel`](https://github.com/kanish10/LLM-Inference-Server/commit/cec01a1)
+gained 128 per-thread running-sum "diagnostic checksums" -- framed as the
+kind of NaN-source debugging instrumentation someone might plausibly add
+without noticing the register cost, which is exactly the point of the demo.
+
+**What the detector caught**, real `perflens run` -> `baseline set` -> `run`
+-> `detect` output, nothing hand-edited:
+
+```
+[MINOR] inference.paged_attention/...paged_attention_kernel(...) duration_ns: 4416 -> 5024 (+13.77%)
+```
+
+`launch__registers_per_thread` went 40 -> 155 (+287.5%); every other suite
+entry was untouched, confirming the detector correctly isolated the
+regression to the one kernel that actually changed.
+
+**What the agent said**, a real API call (this specific run used the Groq
+backend -- `openai/gpt-oss-120b` via `perflens/groq_adapter.py`, not
+Anthropic; `triage.py` supports both, see "How the triage agent works"):
+
+> **Evidence:** duration_ns increased from 4416 to 5024 (+13.77%).
+> regs_per_thread increased by +287.5%. dram throughput decreased by
+> -1.024%. occupancy changed by +0.936%. L2 hit rate decreased by -2.459%.
+> The diff adds a per-thread float array `chk[128]` and associated loops,
+> which directly raises register usage.
+>
+> **Root-cause hypothesis:** The added diagnostic checksum array
+> `float chk[128]` and its initialization/accumulation loops increase
+> registers per thread by ~287%, causing register pressure and likely
+> spills, leading to the observed ~14% runtime regression.
+>
+> **Confidence:** high
+>
+> **Next diagnostic step:** Run Nsight Compute with `--section=Registers
+> --section=Spills` or `--set full` on `paged_attention_kernel` to verify
+> register count and spill metrics, and examine `__launch_bounds__` or
+> consider moving `chk` to shared memory or removing it.
+
+Full report: [`reports/2026-08-23.md`](reports/2026-08-23.md).
+
+**Worth being honest about, not smoothing over:** this isn't the textbook
+"registers up + occupancy down" pattern from `triage.py`'s system prompt --
+occupancy stayed flat (already SM-scheduling-bound at this block size, not
+register-bound, even at 155 regs/thread). The agent noticed this correctly
+(it reported occupancy as roughly unchanged rather than inventing a drop) and
+still correctly attributed the slowdown to register pressure/spill overhead
+adding raw per-thread latency, a distinct mechanism from the occupancy story.
+That's a better demonstration of real reasoning than a case that fit the
+textbook pattern exactly would have been.
+
+Two real bugs surfaced by actually running this pipeline end to end, not by
+inspection, both fixed and covered by regression tests: `collect.py`'s CSV
+parser assumed `ncu`'s stdout was pure CSV (it isn't -- `==PROF==` progress
+lines and the profiled program's own stdout are interleaved with it), and
+`report.py` matched the agent's narrative back to a detector finding on
+`(entry, kernel)` including the full demangled kernel name, which a model
+restating that name in its own words doesn't always reproduce byte-for-byte
+(harmless for the PR gate itself, which never reads the agent's fields -- see
+`report.py`'s `severity_label` -- but it silently dropped the narrative
+section). Also fixed along the way: `suite.yaml`'s `gpu-engine` entries had
+drifted from the real repo (a `kernel_regex` that didn't match its actual
+kernel name, source paths pointing at files that don't exist, a `--once`
+CLI flag `bench_decode` doesn't have), and a real gpu-engine build bug
+(`gpu_kernels` was missing three source files in `CMakeLists.txt`, so it
+never linked) that had gone uncaught because gpu-engine's CUDA path had never
+actually been compiled before.
 
 ## Architecture
 
@@ -71,7 +136,7 @@ perflens/
   gitctx.py    diffs and commit logs scoped to a suite entry's source_paths
   models.py    shared pydantic models
   dashboard/   FastAPI read-only API over the SQLite store (M7)
-tests/         54 tests: synthetic detector cases, fixture CSV parsing,
+tests/         83 tests: synthetic detector cases, fixture CSV parsing,
                 a stubbed-client triage run, a real temp git repo for
                 gitctx, and full CLI wiring
 dashboard-ui/  React + TypeScript dashboard (M7)
@@ -90,7 +155,7 @@ suite.yaml      kernel suite manifest
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,dashboard]"
 
-pytest                    # 54 tests, no GPU required
+pytest                    # 83 tests, no GPU required
 ruff check perflens tests
 mypy perflens
 ```
@@ -144,7 +209,16 @@ and the improvement path is exercised too.
 
 ## How the triage agent works
 
-`triage.py` gives Claude four **read-only** tools -- `get_findings`,
+By default `triage.py` talks to Claude (`--model claude-*`, needs
+`ANTHROPIC_API_KEY`). It can also talk to any Groq model (`--model` set to
+anything else, e.g. `openai/gpt-oss-120b`, needs `GROQ_API_KEY` and the
+`groq` extra: `pip install -e ".[groq]"`) via `perflens/groq_adapter.py`,
+which translates between Anthropic's Messages-API tool-call shape and Groq's
+OpenAI-compatible chat-completions shape on every call -- the agent loop
+below is written once, against the Anthropic shape, and is unaware of which
+backend is actually running. The M6 case study above used the Groq path.
+
+`triage.py` gives the agent four **read-only** tools -- `get_findings`,
 `get_metric_history`, `get_kernel_diff`, `get_commit_log` -- all scoped to the
 specific suite entry's `source_paths`, so the agent can never see a diff
 outside the kernel that actually regressed. It never gets write access to the
@@ -241,15 +315,15 @@ together locally.
 
 ## Claims ledger
 
-The table `CLAUDE.md` asks for, kept honest about what's actually verified
-right now vs. what's still pending the self-hosted runner:
+The table `CLAUDE.md` asks for, kept honest about what's actually verified:
 
 | Claim | Source | Verified? |
 |---|---|---|
-| nightly Nsight Compute across a kernel suite, 5 reps, SQLite baselines | `suite.yaml` + `runs` table + `nightly.yml` | Code path tested end-to-end with fixture data; not yet run against real hardware |
-| median + 3xMAD noise-aware gating on PRs | `detect.py` + `tests/test_detect.py` + `pr-gate.yml` | **Yes** -- synthetic tests pass in CI on every push |
-| agent correlates metric deltas with source diffs into root-cause reports | `triage.py` + `tests/test_triage.py` | Loop + schema validation tested against a stubbed client; not yet run against the live API in this environment |
-| e.g. register-pressure occupancy drop identified | the M6 report itself | **Not yet -- pending real hardware, see Status above** |
+| Nsight Compute across a kernel suite, 5 reps, SQLite baselines | `suite.yaml` + `runs` table | **Yes** -- run for real on an RTX 3060: `perflens run` collected all 6 entries (30 rows), `baseline set` seeded medians/MADs, a second clean run correctly reported zero false positives |
+| median + 3xMAD noise-aware gating on PRs | `detect.py` + `tests/test_detect.py` | **Yes** -- synthetic tests pass in CI on every push, *and* correctly flagged the real M6 regression (+13.77%) while leaving the other 5 untouched entries alone |
+| agent correlates metric deltas with source diffs into root-cause reports | `triage.py` + `tests/test_triage.py` | **Yes** -- real API call (Groq `openai/gpt-oss-120b`) produced a correct root-cause report naming the actual added variable (`chk[128]`), see M6 case study above |
+| e.g. register-pressure regression identified from real evidence | `reports/2026-08-23.md` | **Yes**, with a caveat stated plainly: it's register pressure/spill overhead, not the textbook "occupancy drop" pattern -- occupancy stayed flat here, and the agent correctly said so rather than inventing a drop |
+| nightly workflow runs unattended, two nights running | `nightly.yml` | **Not yet** -- the pipeline itself is proven end-to-end on real hardware (this whole case study); what's left is purely operational (keep a runner online through two cron firings), not further engineering |
 
 ## License
 

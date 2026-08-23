@@ -29,6 +29,23 @@ def test_parse_ncu_csv_missing_columns_raises() -> None:
         parse_ncu_csv("a,b,c\n1,2,3\n")
 
 
+def test_parse_ncu_csv_ignores_interleaved_prof_and_app_stdout() -> None:
+    # Real ncu output is never pure CSV: `==PROF==` progress lines and the
+    # profiled program's own stdout (argv-dependent, so we can't predict it)
+    # share the same stream and land around the --csv block. Confirmed
+    # against a live ncu run on real hardware, not guessed.
+    noisy = (
+        "==PROF== Connected to process 2890 (/root/work/cuda-ray-tracer/build/rt)\n"
+        "scene: 141 spheres, 640x360, 24 spp, depth 8\n"
+        "frame 0: 40.3252 ms\n"
+        + FIXTURE.read_text()
+        + "==PROF== Disconnected from process 2890\n"
+    )
+    rows = parse_ncu_csv(noisy)
+    assert len(rows) == 3
+    assert rows[0].kernel.startswith("paged_attention_kernel")
+
+
 def test_to_kernel_results_assigns_rep_index_per_kernel() -> None:
     rows = parse_ncu_csv(FIXTURE.read_text())
     records = to_kernel_results("inference.paged_attention", rows)

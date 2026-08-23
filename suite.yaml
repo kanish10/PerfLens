@@ -6,41 +6,52 @@
 # alongside this repo on that machine. They will not resolve on a laptop that
 # only has PerfLens checked out; that's expected -- `perflens run` requires
 # `ncu` and these sibling repos, and is meant to run on the GPU box.
+#
+# Every entry below (cmd, kernel_regex, source_paths) was verified against a
+# real build + `ncu` run on an RTX 3060, not copied from the aspirational
+# sketch in CLAUDE.md -- that sketch had several mismatches against the
+# actual gpu-engine/cuda-ray-tracer source (wrong file paths, a kernel_regex
+# that didn't match its real kernel name, a `--once` bench_decode flag that
+# doesn't exist). See M6 case study notes in README.md for what was fixed.
 gpu: "RTX 3060"
 reps: 5
 entries:
   - name: inference.paged_attention
     cwd: ../gpu-engine
-    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    cmd: ./build/bench_decode --weights models --batch 8 --steps 20 --reps 1 --graphs off --out /tmp/bench_decode.csv
     kernel_regex: "paged_attention.*"
     source_paths: ["src/kernels/attention.cu"]
 
   - name: inference.fused_gelu
     cwd: ../gpu-engine
-    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    cmd: ./build/bench_decode --weights models --batch 8 --steps 20 --reps 1 --graphs off --out /tmp/bench_decode.csv
     kernel_regex: "bias_gelu.*"
     source_paths: ["src/kernels/gelu.cu"]
 
   - name: inference.layernorm
     cwd: ../gpu-engine
-    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    cmd: ./build/bench_decode --weights models --batch 8 --steps 20 --reps 1 --graphs off --out /tmp/bench_decode.csv
     kernel_regex: "layer_norm.*|layernorm.*"
     source_paths: ["src/kernels/layernorm.cu"]
 
+  # kv_append_kernel (not "kv_scatter"/"scatter_kv" -- there is no kernel by
+  # that name) lives in attention.cu alongside paged_attention_kernel, not in
+  # a separate kv_cache.cu -- there's no such file under src/kernels/.
   - name: inference.kv_scatter
     cwd: ../gpu-engine
-    cmd: ./build/bench_decode --batch 8 --steps 64 --once
-    kernel_regex: "kv_scatter.*|scatter_kv.*"
-    source_paths: ["src/kernels/kv_cache.cu"]
+    cmd: ./build/bench_decode --weights models --batch 8 --steps 20 --reps 1 --graphs off --out /tmp/bench_decode.csv
+    kernel_regex: "kv_append.*"
+    source_paths: ["src/kernels/attention.cu"]
 
+  # argmax_kernel lives in logits.cu, not a sampling.cu (no such file exists).
   - name: inference.argmax
     cwd: ../gpu-engine
-    cmd: ./build/bench_decode --batch 8 --steps 64 --once
+    cmd: ./build/bench_decode --weights models --batch 8 --steps 20 --reps 1 --graphs off --out /tmp/bench_decode.csv
     kernel_regex: "argmax.*|sample_argmax.*"
-    source_paths: ["src/kernels/sampling.cu"]
+    source_paths: ["src/kernels/logits.cu"]
 
   - name: raytracer.trace
     cwd: ../cuda-ray-tracer
-    cmd: ./build/rt --scene bench.scene --frames 3 --headless
+    cmd: ./build/rt --scene bench.scene --frames 10 --headless
     kernel_regex: "trace_rays.*"
     source_paths: ["src/trace.cu"]

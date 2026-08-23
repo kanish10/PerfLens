@@ -1,0 +1,15 @@
+{
+  "findings": [
+    {
+      "entry": "inference.paged_attention",
+      "kernel": "paged_attention_kernel(const __half *, int, const __half *, const int *, const int *, __half *, int, int, int, int, int, int)",
+      "severity": "major",
+      "evidence_summary": "duration_ns increased from 4416 to 5024 (+13.77%). regs_per_thread increased by +287.5%. dram throughput decreased by -1.024%. occupancy changed by +0.936%. L2 hit rate decreased by -2.459%. The diff adds a per-thread float array `chk[128]` and associated loops, which directly raises register usage.",
+      "root_cause_hypothesis": "The added diagnostic checksum array `float chk[128]` and its initialization/accumulation loops increase registers per thread by ~287%, causing register pressure and likely spills, leading to the observed ~14% runtime regression.",
+      "confidence": "high",
+      "next_diagnostic_step": "Run Nsight Compute with --section=Registers --section=Spills or --set full on paged_attention_kernel to verify register count and spill metrics, and examine __launch_bounds__ or consider moving chk to shared memory or removing it."
+    }
+  ],
+  "model": "openai/gpt-oss-120b",
+  "generated_at": "2026-08-23T05:55:01.489214+00:00"
+}

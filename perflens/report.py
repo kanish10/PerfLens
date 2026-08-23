@@ -43,13 +43,30 @@ def _findings_table(findings: list[Finding]) -> str:
 def _triage_narrative(findings: list[Finding], triage: TriageReport | None) -> str:
     if triage is None or not triage.findings:
         return ""
-    by_key = {(t.entry, t.kernel): t for t in triage.findings}
+    # Keyed on entry alone, not (entry, kernel): kernel names are long
+    # compiler-demangled C++ signatures (e.g. ncu drops leading namespace
+    # segments like "kernels::<" when only one kernel type is in the capture
+    # window), and an agent restating one in its own words -- especially a
+    # smaller/free model -- won't always reproduce it byte-for-byte. entry is
+    # a short internal identifier the agent has no reason to paraphrase, and
+    # detect.py only ever produces one regression Finding per entry (primary
+    # metric is duration_ns; every suite.yaml entry targets one kernel), so
+    # it's already an unambiguous key. Caught by a real run: a Groq
+    # gpt-oss-120b report cleaned up "unnamed>::paged_attention_kernel(...)"
+    # to "paged_attention_kernel(...)", silently dropping this section.
+    by_key = {t.entry: t for t in triage.findings}
     sections = ["\n## Agent analysis\n"]
     for f in findings:
-        t = by_key.get((f.entry, f.kernel))
+        t = by_key.get(f.entry)
         if t is None:
             continue
-        sections.append(f"### {f.entry} / `{f.kernel}` -- {t.severity.upper()}\n")
+        # Severity always comes from the detector (severity_label(f)), never
+        # from the agent's own restated t.severity -- the system prompt tells
+        # the agent not to change it, but rendering shouldn't trust that a
+        # model (especially a smaller/free one) always complies. Caught by a
+        # real run: a Groq gpt-oss-120b report said "major" here for a
+        # finding the detector had classified "minor".
+        sections.append(f"### {f.entry} / `{f.kernel}` -- {severity_label(f)}\n")
         sections.append(f"**Evidence:** {t.evidence_summary}\n")
         sections.append(f"**Root-cause hypothesis:** {t.root_cause_hypothesis}\n")
         sections.append(f"**Confidence:** {t.confidence}\n")

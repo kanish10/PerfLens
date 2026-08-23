@@ -205,7 +205,14 @@ def detect_cmd(run_id: int, db: str, threshold: float, json_out: str | None) -> 
     "together with --head-sha to force one pair for every entry",
 )
 @click.option("--head-sha", default=None, help="See --base-sha")
-@click.option("--model", default=triage.DEFAULT_MODEL, show_default=True)
+@click.option(
+    "--model",
+    default=triage.DEFAULT_MODEL,
+    show_default=True,
+    help="A 'claude-*' model routes to Anthropic (needs ANTHROPIC_API_KEY); any other "
+    "model name routes to Groq's OpenAI-compatible API via groq_adapter (needs "
+    "GROQ_API_KEY and the 'groq' extra installed).",
+)
 @click.option("--out", default=None, type=click.Path())
 def triage_cmd(
     run_id: int,
@@ -217,7 +224,8 @@ def triage_cmd(
     model: str,
     out: str | None,
 ) -> None:
-    """Run the Claude triage agent over a run's findings. Requires ANTHROPIC_API_KEY."""
+    """Run the triage agent over a run's findings. Requires ANTHROPIC_API_KEY (default
+    model) or GROQ_API_KEY (--model <a non-claude-* model>)."""
     conn = store.get_connection(db)
     store.init_db(conn)
     s = _load_suite(suite)

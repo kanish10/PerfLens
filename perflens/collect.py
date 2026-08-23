@@ -97,13 +97,26 @@ class RawKernelRow:
 def parse_ncu_csv(csv_text: str) -> list[RawKernelRow]:
     """Parse ncu's long-format CSV (one row per kernel-launch x metric) into
     one RawKernelRow per launch, preserving file order.
+
+    ncu's stdout is not pure CSV: `==PROF==` progress messages and the
+    profiled program's own stdout share the same stream and land interleaved
+    before (and sometimes after) the actual --csv block. ncu quotes every
+    field of every real CSV record, so every genuine CSV line starts with a
+    double quote and nothing else does -- filtering on that isolates the CSV
+    regardless of what surrounds it, rather than assuming the whole stream is
+    clean CSV (fixture-based tests never exercised this because the fixture
+    file is hand-written pure CSV with no such preamble).
     """
-    reader = csv.DictReader(io.StringIO(csv_text))
+    csv_lines = [line for line in csv_text.splitlines() if line.startswith('"')]
+    reader = csv.DictReader(io.StringIO("\n".join(csv_lines)))
     required = {"ID", "Kernel Name", "Metric Name", "Metric Unit", "Metric Value"}
     fieldnames = set(reader.fieldnames or [])
     missing = required - fieldnames
     if missing:
-        raise CollectionError(f"ncu CSV missing expected columns: {sorted(missing)}")
+        raise CollectionError(
+            f"ncu CSV missing expected columns: {sorted(missing)}\n"
+            f"first 500 chars of raw ncu stdout:\n{csv_text[:500]}"
+        )
 
     rows_by_id: dict[str, RawKernelRow] = {}
     order: list[str] = []

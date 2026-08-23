@@ -98,6 +98,63 @@ def test_render_markdown_includes_agent_narrative() -> None:
     assert "claude-opus-5" in md
 
 
+def test_render_markdown_narrative_severity_always_comes_from_detector() -> None:
+    # Real bug, caught on a live run: a Groq gpt-oss-120b triage said "major"
+    # for a finding the detector had classified "minor" -- the system prompt
+    # tells the agent not to change severity, but rendering must not trust
+    # that every model complies. The narrative heading must show the
+    # detector's severity, not the agent's restated (and here, wrong) one.
+    minor_finding = MAJOR_FINDING.model_copy(update={"severity": "minor", "delta_pct": 13.77})
+    triage_report = TriageReport(
+        findings=[
+            FindingTriage(
+                entry="inference.paged_attention",
+                kernel="paged_attention_kernel",
+                severity="major",  # agent got this wrong; must be ignored
+                evidence_summary="duration +13.77%, regs_per_thread +287.5%",
+                root_cause_hypothesis="Added per-thread checksum array increased register pressure.",
+                confidence="high",
+                next_diagnostic_step="Re-profile with --set full",
+            )
+        ],
+        model="openai/gpt-oss-120b",
+        generated_at="2026-01-02T00:05:00+00:00",
+    )
+    md = report.render_markdown(RUN, [minor_finding], triage_report)
+    assert "-- MINOR" in md
+    assert "-- MAJOR" not in md
+
+
+def test_render_markdown_narrative_matches_on_entry_despite_kernel_name_mismatch() -> None:
+    # Real bug, caught on a live run: a Groq gpt-oss-120b report restated the
+    # kernel name as "paged_attention_kernel(...)" when the detector's Finding
+    # (and the DB) had it as "unnamed>::paged_attention_kernel(...)" -- ncu
+    # drops leading namespace segments in single-kernel capture windows, and
+    # the agent silently "cleaned up" the odd-looking prefix when repeating
+    # it. An exact (entry, kernel) match on that string dropped the whole
+    # narrative section for a real finding.
+    finding = MAJOR_FINDING.model_copy(
+        update={"kernel": "unnamed>::paged_attention_kernel(const __half *, int)"}
+    )
+    triage_report = TriageReport(
+        findings=[
+            FindingTriage(
+                entry="inference.paged_attention",
+                kernel="paged_attention_kernel(const __half *, int)",  # agent paraphrased this
+                severity="major",
+                evidence_summary="duration +25.3%",
+                root_cause_hypothesis="Register pressure from added locals.",
+                confidence="high",
+                next_diagnostic_step="Re-profile with --set full",
+            )
+        ],
+        model="openai/gpt-oss-120b",
+        generated_at="2026-01-02T00:05:00+00:00",
+    )
+    md = report.render_markdown(RUN, [finding], triage_report)
+    assert "Register pressure from added locals." in md
+
+
 def test_write_report_creates_parent_dirs(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "report.md"
     result = report.write_report(out, "# hello")
