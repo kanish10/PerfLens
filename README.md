@@ -23,12 +23,15 @@ report and decides.
   history, source diff, commit log -- backed by Claude or Groq
 - Markdown reports, PR comments, and commit-status gating via `gh`
 - A read-only FastAPI + React dashboard over the same SQLite store
+- `perflens tune`: compiler-in-the-loop search over a kernel's compile flags
+  and launch parameters, comparing random, evolutionary, and agent-guided
+  search against exhaustive ground truth (see below)
 
 ## Case study: a caught regression
 
 `paged_attention_kernel` in [`gpu-engine`](https://github.com/kanish10/LLM-Inference-Server/tree/main/gpu-engine)
 was deliberately regressed on a
-[`demo-regression` branch](https://github.com/kanish10/LLM-Inference-Server/commit/cec01a1):
+[`demo-regression` branch](https://github.com/kanish10/LLM-Inference-Server/blob/demo-regression/gpu-engine/src/kernels/attention.cu):
 128 per-thread running-sum accumulators were added, framed as debug
 instrumentation for tracing a NaN back to its source key -- the kind of
 change an engineer might genuinely make without weighing its register cost.
@@ -115,7 +118,7 @@ points them at GPU kernels.
 
 ```
 perflens/
-  cli.py       perflens run|baseline|detect|triage|report|gate
+  cli.py       perflens run|baseline|detect|triage|report|gate|tune
   collect.py   ncu invocation + CSV parsing -> KernelResultRecord
   store.py     SQLite (WAL) schema + queries: runs, kernel_results, baselines
   detect.py    median + 3*MAD noise-aware regression/improvement detector
@@ -125,11 +128,16 @@ perflens/
   gitctx.py    diffs and commit logs scoped to a suite entry's source_paths
   models.py    shared pydantic models
   dashboard/   FastAPI read-only API over the SQLite store
-tests/         83 tests: synthetic detector cases, fixture CSV parsing,
+  tune/        compiler-in-the-loop tuning: search spaces, ptxas parsing,
+               GPU runner, random/evo/exhaustive search, the tuning agent,
+               SQLite tables, and the results report
+tests/         137 tests: synthetic detector cases, fixture CSV parsing,
                 a stubbed-client triage run, a real temp git repo for
-                gitctx, and full CLI wiring
+                gitctx, full CLI wiring, and the tuner (real nvcc 12.8
+                ptxas logs, a scripted agent client, a synthetic landscape)
 dashboard-ui/  React + TypeScript dashboard
 scripts/       demo_fixture_triage.py -- run the real agent on fixture data
+               run_tune_experiment.sh -- the full tuning experiment on the GPU box
 .github/workflows/
   ci.yml        lint + type-check + test, every push/PR (GitHub-hosted)
   nightly.yml   the nightly collection + triage pipeline (self-hosted GPU runner)
@@ -144,7 +152,7 @@ suite.yaml      kernel suite manifest
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,dashboard]"
 
-pytest                    # 83 tests, no GPU required
+pytest                    # 137 tests, no GPU required
 ruff check perflens tests
 mypy perflens
 ```
@@ -239,6 +247,82 @@ delta, the agent is instructed to say so and hypothesize environment causes
 (clock state, driver version, thermal throttling) rather than invent a code
 change that isn't there.
 
+## Compiler-in-the-loop tuning (`perflens tune`)
+
+The triage agent explains slowdowns after the fact. `perflens tune` puts an
+agent inside the optimization loop instead, and measures whether that
+actually beats conventional search.
+
+For one gpu-engine kernel, it searches a declared space of compile flags and
+launch parameters. Every candidate goes through the same pipeline:
+
+1. compiled with nvcc `-Xptxas -v`, recording compile time plus registers,
+   spills, and ptxas warnings;
+2. checked against the FP32 CPU reference, so a fast but wrong
+   configuration is never accepted;
+3. timed on the GPU (cudaEvent median of 200 samples, with MAD).
+
+The kernel-side harness that builds, checks, and times candidates lives in
+gpu-engine ([`bench/TUNING.md`](https://github.com/kanish10/LLM-Inference-Server/blob/main/gpu-engine/bench/TUNING.md)).
+
+**The experiment.** Four strategies run at an equal evaluation budget, and
+all of them start from the shipped default:
+
+- **exhaustive:** every config in the space. This is the ground truth.
+- **random:** uniform sampling without replacement.
+- **evo:** (mu + lambda) evolution with tournament selection and
+  one-dimension mutation.
+- **agent:** an LLM proposes the next candidates through a
+  `propose_candidates` tool and gives a rationale for each. It has two
+  read-only tools, the kernel source and the raw ptxas log of any
+  evaluated candidate, plus the results of everything evaluated so far.
+  Proposals are validated against the search space before anything is
+  built. Duplicates and out-of-space configs are rejected without spending
+  budget, and the report counts them. The agent has no shell and cannot
+  write files.
+
+| Kernel | Search space | Configs |
+|---|---|---|
+| `bias_gelu` | threads {32..1024} × blocks per row {1,2,4,8,12} × half2 vectorization {off,on} × `--use_fast_math` | 120 |
+| `add_layernorm`, `argmax` | threads {32..1024} × `--use_fast_math` | 12 each |
+
+At batch 8, the shipped `bias_gelu` launch is one block per row: 8 blocks
+on a 28-SM GPU. Splitting rows across blocks is the knob that targets the
+8–17% achieved occupancy measured in M7.
+
+`-maxrregcount` and `__launch_bounds__` are supported by the harness but
+left out of the spaces. ptxas showed they cannot bind for these kernels:
+every config uses at most 22 registers, and on sm_86 ptxas raises any
+`-maxrregcount` below 24 up to 24.
+
+```bash
+perflens tune spaces
+perflens tune run --kernel bias_gelu --batch 8 --strategy exhaustive
+perflens tune run --kernel bias_gelu --batch 8 --strategy agent --budget 20 --seed 1
+perflens tune verify --kernel bias_gelu --batch 8     # Nsight Compute: default vs. best
+perflens tune report                                  # results/tune/{summary.csv,REPORT.md}
+scripts/run_tune_experiment.sh                        # the whole matrix, on the GPU box
+```
+
+`--runner fake` swaps in a synthetic landscape for dry runs without a GPU.
+Any report that includes fake runs is stamped as synthetic.
+
+**How runs are scored.** Each strategy decides using its own measurements,
+but the report scores its picks on the exhaustive run's measurement of the
+same config, so timing noise can't flip the comparison. For each strategy
+and kernel/batch, across seeds, the report gives:
+
+- evaluations needed to reach within 5% of the exhaustive best;
+- final regret against the exhaustive best;
+- invalid agent proposals;
+- total nvcc time spent.
+
+`REPORT.md` ends with a claims ledger that ties every headline number to
+the `summary.csv` row it comes from.
+
+**Results:** pending the first run on GPU hardware. `results/tune/` is
+committed once that run is done.
+
 ## Self-hosted runner setup
 
 `nightly.yml` and `pr-gate.yml` both require `runs-on: [self-hosted, gpu]`.
@@ -292,6 +376,15 @@ change that isn't there.
   what's unverified is a self-hosted runner staying online through repeated
   unattended cron firings, which is an operational question rather than one
   about the pipeline's correctness.
+- **Tuning spaces are small, and results come from one GPU.** The `bias_gelu`
+  space has 120 configs and the others have 12, all at GPT-2 124M shapes on
+  one RTX 3060. Exhaustive search is affordable at this size, which is
+  exactly what makes it usable as ground truth. The flip side is that a
+  search strategy's advantage here may not carry over to larger spaces or
+  other GPUs.
+- **The agent only picks configurations.** It can't edit kernel source;
+  source-level variants (like the half2 path) have to exist as macros
+  first.
 - **Wall-clock ingestion isn't built.** `bench_decode`'s own CSV output
   (app-level throughput, distinct from `ncu`'s kernel-level durations) isn't
   ingested as a second PerfLens channel yet.
