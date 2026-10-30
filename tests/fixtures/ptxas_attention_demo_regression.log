@@ -1,0 +1,11 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN7kernels55_GLOBAL__N__a13c9678_22_attention_regressed_cu_90036d1722paged_attention_kernelEPK6__halfiS3_PKiS5_PS1_iiiiii' for 'sm_86'
+ptxas info    : Function properties for _ZN7kernels55_GLOBAL__N__a13c9678_22_attention_regressed_cu_90036d1722paged_attention_kernelEPK6__halfiS3_PKiS5_PS1_iiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 155 registers, used 1 barriers, 424 bytes cmem[0]
+ptxas info    : Compile time = 444.384 ms
+ptxas info    : Compiling entry function '_ZN7kernels55_GLOBAL__N__a13c9678_22_attention_regressed_cu_90036d1716kv_append_kernelEP6__halfPKS1_S4_iPKiS6_iiiiii' for 'sm_86'
+ptxas info    : Function properties for _ZN7kernels55_GLOBAL__N__a13c9678_22_attention_regressed_cu_90036d1716kv_append_kernelEP6__halfPKS1_S4_iPKiS6_iiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 0 barriers, 424 bytes cmem[0]
+ptxas info    : Compile time = 3.938 ms
