@@ -1,10 +1,12 @@
-"""perflens CLI: run | baseline set | detect | triage | report | gate | dashboard."""
+"""perflens CLI: run | baseline set | detect | triage | report | gate | dashboard | tune."""
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
+import statistics
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +15,13 @@ import click
 import yaml
 
 from perflens import collect, detect, report, store, triage
-from perflens.models import Finding, RunInfo, Suite, TriageReport
+from perflens.models import Finding, RunInfo, Suite, SuiteEntry, TriageReport
+from perflens.tune import agent as tune_agent
+from perflens.tune import db as tune_db
+from perflens.tune import report as tune_report
+from perflens.tune import runner as tune_runner
+from perflens.tune import space as tune_space
+from perflens.tune import strategies as tune_strategies
 
 DEFAULT_DB = "perflens.db"
 DEFAULT_SUITE = "suite.yaml"
@@ -387,6 +395,241 @@ def dashboard_cmd(db: str, host: str, port: int, reload: bool) -> None:
 
     os.environ["PERFLENS_DB"] = db
     uvicorn.run("perflens.dashboard.api:app", host=host, port=port, reload=reload)
+
+
+# ---------------------------------------------------------------------------
+# perflens tune: compiler-in-the-loop tuning of gpu-engine kernels
+# ---------------------------------------------------------------------------
+
+DEFAULT_ENGINE_DIR = "../gpu-engine"
+DEFAULT_TUNE_OUT = "results/tune"
+
+
+@main.group("tune")
+def tune_group() -> None:
+    """Search compile flags and launch parameters for a gpu-engine kernel."""
+
+
+@tune_group.command("spaces")
+def tune_spaces_cmd() -> None:
+    """List the kernels that can be tuned and their search spaces."""
+    for space in tune_space.SPACES.values():
+        click.echo(json.dumps(space.describe()))
+
+
+@tune_group.command("run")
+@click.option("--kernel", required=True, type=click.Choice(sorted(tune_space.SPACES)))
+@click.option("--batch", default=8, show_default=True, type=int)
+@click.option("--strategy", required=True, type=click.Choice(tune_strategies.STRATEGIES))
+@click.option(
+    "--budget",
+    default=20,
+    show_default=True,
+    type=int,
+    help="Evaluations per run, counting the default config (ignored by exhaustive)",
+)
+@click.option("--seed", default=1, show_default=True, type=int)
+@click.option("--db", default=DEFAULT_DB, show_default=True)
+@click.option("--engine-dir", default=DEFAULT_ENGINE_DIR, show_default=True)
+@click.option(
+    "--runner",
+    "runner_kind",
+    default="local",
+    show_default=True,
+    type=click.Choice(["local", "fake"]),
+    help="local = build and time on this machine's GPU; fake = synthetic landscape (no GPU, for dry runs)",
+)
+@click.option("--model", default=triage.DEFAULT_MODEL, show_default=True, help="Agent model (agent only)")
+@click.option("--samples", default=200, show_default=True, type=int)
+@click.option("--inner", default=10, show_default=True, type=int)
+@click.option("--warmup", default=20, show_default=True, type=int)
+def tune_run_cmd(
+    kernel: str,
+    batch: int,
+    strategy: str,
+    budget: int,
+    seed: int,
+    db: str,
+    engine_dir: str,
+    runner_kind: str,
+    model: str,
+    samples: int,
+    inner: int,
+    warmup: int,
+) -> None:
+    """Run one search strategy for one kernel and batch size, recording every evaluation."""
+    space = tune_space.get_space(kernel)
+    runner: tune_runner.Runner
+    if runner_kind == "fake":
+        runner = tune_runner.FakeRunner(seed=seed)
+        gpu, driver, engine_sha = "fake", "fake", None
+    else:
+        try:
+            runner = tune_runner.LocalGpuRunner(engine_dir, samples=samples, inner=inner, warmup=warmup)
+        except tune_runner.RunnerError as exc:
+            raise click.ClickException(str(exc)) from exc
+        gpu, driver = _nvidia_smi_field("name"), _nvidia_smi_field("driver_version")
+        engine_sha = collect._git_sha(engine_dir)
+
+    if strategy == "exhaustive":
+        budget = space.size
+    if budget < 1:
+        raise click.ClickException("--budget must be at least 1")
+
+    conn = store.get_connection(db)
+    store.init_db(conn)
+    tune_db.init_tune_db(conn)
+    run_id = tune_db.insert_run(
+        conn,
+        kernel=kernel,
+        batch=batch,
+        strategy=strategy,
+        seed=seed,
+        budget=budget,
+        gpu=gpu,
+        driver=driver,
+        engine_sha=engine_sha,
+        model=model if strategy == "agent" else None,
+        space=space.describe(),
+    )
+
+    def on_eval(rec: tune_strategies.EvalRecord) -> None:
+        tune_db.insert_eval(conn, run_id, rec)
+        r = rec.result
+        status = "ok" if r.correct else ("INCORRECT" if r.build_ok else "BUILD FAILED")
+        click.echo(
+            f"  #{rec.idx:>3} {r.config.short():<28} {status:<12} "
+            f"{'' if r.median_us is None else f'{r.median_us:.3f} us'} "
+            f"regs={r.registers} compile={'' if r.compile_ms is None else f'{r.compile_ms / 1000:.1f}s'}"
+        )
+
+    ev = tune_strategies.Evaluator(space, runner, batch, budget, on_eval=on_eval)
+    click.echo(f"tune run {run_id}: {kernel} batch={batch} strategy={strategy} budget={budget} seed={seed}")
+    try:
+        if strategy == "exhaustive":
+            outcome = tune_strategies.run_exhaustive(ev)
+        elif strategy == "random":
+            outcome = tune_strategies.run_random(ev, seed)
+        elif strategy == "evo":
+            outcome = tune_strategies.run_evolutionary(ev, seed)
+        else:
+            outcome = tune_agent.run_agent(ev, model=model)
+    except triage.TriageError as exc:
+        tune_db.finish_run(conn, run_id, "agent_error", 0)
+        raise click.ClickException(f"agent failed after {len(ev.records)} evaluations: {exc}") from exc
+
+    tune_db.finish_run(conn, run_id, outcome.stop_reason, outcome.invalid_proposals)
+    best = ev.best()
+    default = ev.records[0].result if ev.records else None
+    if best is None:
+        click.echo(f"run {run_id} finished ({outcome.stop_reason}): no correct configuration found")
+        return
+    line = f"run {run_id} finished ({outcome.stop_reason}): best #{best.idx} {best.result.config.short()} "
+    line += f"{best.result.median_us:.3f} us"
+    if default is not None and default.median_us and default.correct:
+        line += f" ({default.median_us / best.result.fitness:.2f}x vs. default {default.median_us:.3f} us)"
+    if outcome.invalid_proposals:
+        line += f", {outcome.invalid_proposals} invalid proposals"
+    click.echo(line)
+
+
+@tune_group.command("report")
+@click.option("--db", default=DEFAULT_DB, show_default=True)
+@click.option("--out", "out_dir", default=DEFAULT_TUNE_OUT, show_default=True, type=click.Path())
+def tune_report_cmd(db: str, out_dir: str) -> None:
+    """Write summary.csv and REPORT.md (with a claims ledger) from all finished tuning runs."""
+    conn = store.get_connection(db)
+    tune_db.init_tune_db(conn)
+    csv_path, md_path = tune_report.write_report(conn, Path(out_dir), db)
+    click.echo(f"wrote {csv_path} and {md_path}")
+
+
+@tune_group.command("verify")
+@click.option("--kernel", required=True, type=click.Choice(sorted(tune_space.SPACES)))
+@click.option("--batch", default=8, show_default=True, type=int)
+@click.option("--db", default=DEFAULT_DB, show_default=True)
+@click.option("--engine-dir", default=DEFAULT_ENGINE_DIR, show_default=True)
+@click.option("--ncu-path", default="ncu", show_default=True)
+@click.option("--reps", default=5, show_default=True, type=int)
+@click.option("--out", "out_dir", default=DEFAULT_TUNE_OUT, show_default=True, type=click.Path())
+def tune_verify_cmd(
+    kernel: str, batch: int, db: str, engine_dir: str, ncu_path: str, reps: int, out_dir: str
+) -> None:
+    """Re-measure the default and the exhaustive-best config with Nsight Compute.
+
+    Stored as a normal PerfLens run (branch "tune-verify"), so it also shows up
+    in the dashboard, and appended to <out>/ncu_verify.csv.
+    """
+    space = tune_space.get_space(kernel)
+    conn = store.get_connection(db)
+    store.init_db(conn)
+    tune_db.init_tune_db(conn)
+    _, truth = tune_report.summarize(conn)
+    gt = truth.get((kernel, batch))
+    if gt is None or gt.best_key is None:
+        raise click.ClickException(f"no exhaustive run for {kernel} batch {batch}; run that first")
+    try:
+        runner = tune_runner.LocalGpuRunner(engine_dir)
+    except tune_runner.RunnerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    run_id = store.insert_run(
+        conn,
+        RunInfo(
+            ts=datetime.now(UTC).isoformat(),
+            git_sha=_git("rev-parse", "HEAD"),
+            branch="tune-verify",
+            gpu=_nvidia_smi_field("name"),
+            driver=_nvidia_smi_field("driver_version"),
+            cuda_version=_cuda_version(),
+            suite_hash=f"tune:{kernel}:b{batch}",
+        ),
+    )
+    best_cfg = tune_space.TuneConfig(**json.loads(gt.best_key))
+    rows = []
+    for label, cfg in (("default", space.default), ("best", best_cfg)):
+        binary = runner.binary_for(space, cfg)
+        entry = SuiteEntry(
+            name=f"tune.{kernel}.b{batch}.{label}",
+            cwd=str(Path(engine_dir).resolve()),
+            cmd=f"{binary} --batch {batch} --samples 1 --inner {reps} --warmup 2",
+            kernel_regex=space.kernel_regex,
+            source_paths=list(space.source_files),
+        )
+        try:
+            records = collect.run_entry(entry, reps, ncu_path=ncu_path)
+        except collect.CollectionError as exc:
+            raise click.ClickException(str(exc)) from exc
+        store.insert_kernel_results(conn, run_id, records)
+        durations = [r.duration_ns for r in records]
+        rows.append(
+            {
+                "run_id": run_id,
+                "kernel": kernel,
+                "batch": batch,
+                "label": label,
+                "config": cfg.short(),
+                "reps": len(records),
+                "median_duration_ns": statistics.median(durations) if durations else None,
+                "regs_per_thread": records[0].regs_per_thread if records else None,
+                "occupancy_pct": statistics.median(
+                    [r.occupancy_pct for r in records if r.occupancy_pct is not None] or [0.0]
+                ),
+            }
+        )
+        click.echo(
+            f"{label:<8} {cfg.short():<28} {rows[-1]['median_duration_ns']} ns (ncu, {len(records)} reps)"
+        )
+
+    out_path = Path(out_dir) / "ncu_verify.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not out_path.exists()
+    with out_path.open("a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        if new_file:
+            writer.writeheader()
+        writer.writerows(rows)
+    click.echo(f"perflens run {run_id} stored; appended {out_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN7kernels39_GLOBAL__N__7ba401c9_7_gelu_cu_49345a2d16bias_gelu_kernelEP6__halfPKS1_S4_i' for 'sm_86'
+ptxas info    : Function properties for _ZN7kernels39_GLOBAL__N__7ba401c9_7_gelu_cu_49345a2d16bias_gelu_kernelEP6__halfPKS1_S4_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 0 barriers, 380 bytes cmem[0]
+ptxas info    : Compile time = 6.066 ms
